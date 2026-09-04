@@ -939,6 +939,11 @@ class VirtualGPU : public device::VirtualDevice {
   //! accounting/estimator state rather than observable queue state.
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
   void PhiPublishSlot() const;  //!< mirror this stream's state where the shadow selector can read it
+  //! ⭐ Count `k` dispatches AND publish the new count. ⛔ The publish is not optional: the shadow
+  //! reader's rate is `(disp_now - base_disp) / (t_ref - base_start)` with `t_ref` taken NOW, so a
+  //! `disp_now` that only advances when a completion sample lands makes a busy stream read SLOW --
+  //! low rho, low `H_q`, ring looks free-er: the MERGE direction. See Device::PhiPublishDisp.
+  void PhiNoteDispatch(uint64_t k) const;
   //! Count a recycled signal the `is_dispatch` tag DECLINED -- the positive control for that tag.
   void PhiCountSkipped() const { phi_d_skipped_.fetch_add(1, std::memory_order_relaxed); }
   //! High-water mark of the drain-point sweep, so its budget is observed rather than assumed.

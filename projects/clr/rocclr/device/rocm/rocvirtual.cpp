@@ -884,6 +884,13 @@ void VirtualGPU::PhiPublishSlot() const {
                          phi_d_ticks_.load(std::memory_order_relaxed), bs, bd, dn);
 }
 
+void VirtualGPU::PhiNoteDispatch(uint64_t k) const {
+  const uint64_t n = phi_dispatches_.fetch_add(k, std::memory_order_relaxed) + k;
+  if (phi_slot_ != 0xFFFFFFFFu) {
+    dev().PhiPublishDisp(phi_slot_, n);
+  }
+}
+
 void VirtualGPU::HwQueueTracker::PhiSweepCompleted() {
   if (!gpu_.dev().PhiActive() || signal_list_.empty()) {
     return;
@@ -1895,7 +1902,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // rho/d == the dispatch rate. ⛔ Gated: at PHI=0 this is a stock-path atomic RMW on every
   // dispatch, bought for a counter nobody reads.
   if (phi_active) {
-    phi_dispatches_.fetch_add(1, std::memory_order_relaxed);  // [B3 deferred to its own stage]
+    PhiNoteDispatch(1);
   }
 
   // Wait on signal ?
@@ -2094,7 +2101,7 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
         }
       }
     }
-    phi_dispatches_.fetch_add(kernel_packets, std::memory_order_relaxed);  // [B3 deferred]
+    PhiNoteDispatch(kernel_packets);
 
     // ⭐⭐ GRAPH `d` WITHOUT THE PROFILING PATH. Pick ONE kernel packet to carry a Phi-only
     // completion signal. The existing recycle-point sampler in ActiveSignal() then harvests it for
