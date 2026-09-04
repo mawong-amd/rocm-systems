@@ -805,7 +805,7 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
 
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_val, Timestamp* ts,
                                                       bool attach_signal, bool is_dispatch,
-                                                      bool phi_only) {
+                                                      bool phi_only, bool phi_detached) {
   amd::Command* cmd = gpu_.command();
   // If no signal is needed, decrement the refcount and clear the hw_event of current command
   if (!attach_signal) {
@@ -937,7 +937,12 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
   // ⚠️ The CAUSE is not understood -- why one retained ProfilingSignal makes every LATER dispatch
   // ~3 us slower. If that cost is real on the ordinary path it is a pre-existing clr defect and a
   // bigger deal than this policy. Tracked in work/task313/ODDITIES.md #1; get the story before any PR.
-  if (phi_only) {
+  if (phi_detached) {
+    // ⛔ Touch `cmd` NEITHER WAY. On the graph batch path the AccumulateCommand legitimately owns a
+    // HW event, attached by the last-slot ActiveSignal() a few lines before this call; clearing it
+    // (what `phi_only` does) would release a live event out from under the graph's own bookkeeping.
+    // Stock's answer for a packet nobody asked to track is simply to leave the command alone.
+  } else if (phi_only) {
     if (cmd != nullptr) {
       if (cmd->HwEvent() != nullptr) {
         reinterpret_cast<ProfilingSignal*>(cmd->HwEvent())->release();
@@ -1924,6 +1929,9 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
   // contribute to H_q and not to T_q until the PROFILED-BATCH path lands -- see
   // work/task313/HANDOFF-CAP4.md step 3; that route is different from the tail signal and is the
   // one that has never been costed.
+  // ⛔ LOCAL, not a member: this block runs BEFORE `std::scoped_lock lock(execution())` below, so
+  // member state here would be a cross-stream race on a shared vgpu.
+  size_t phi_batch_target = SIZE_MAX;
   if (dev().PhiActive()) {
     uint64_t kernel_packets = 0;
     for (size_t i = 0; i < numPackets; ++i) {
@@ -1938,6 +1946,40 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
       }
     }
     phi_dispatches_.fetch_add(kernel_packets, std::memory_order_relaxed);
+
+    // ⭐⭐ GRAPH `d` WITHOUT THE PROFILING PATH. Pick ONE kernel packet to carry a Phi-only
+    // completion signal. The existing recycle-point sampler in ActiveSignal() then harvests it for
+    // free -- no Timestamp, no AddProfilingSignal, no HW event, so none of the retained-signal cost
+    // that makes the profiled-batch route (`timestamp_ != nullptr`) expensive.
+    // ⭐ ONE per batch, not per packet: per-packet forcing would make ActiveSignal() wrap its pool
+    // mid-batch and WaitCurrent() on a packet whose doorbell has not rung yet -- a self-deadlock,
+    // and the likely mechanism behind the batch-tail hang. One per batch advances the pool exactly
+    // as one ordinary dispatch does, and the signal it waits on belongs to a PREVIOUS, already
+    // doorbelled batch.
+    // ⛔ NEVER the last packet: TrackQueueProgress() (`:2311`) and the `hasPendingDispatch_` clear
+    // (`:2307`) both read ONLY the final slot, so an interior packet cannot disturb queue-idle
+    // tracking -- which is the coupling that cost 25-46x in release/reacquire churn on the
+    // single-dispatch path.
+    if (kernel_packets > 0 && numPackets > 1) {
+      const uint32_t rot = phi_batch_rot_.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t want = rot % kernel_packets;  // rotate over kernels, not over all packets
+      uint64_t ordinal = 0;
+      for (size_t i = 0; i + 1 < numPackets; ++i) {  // exclude the final packet
+        const uint16_t hdr = static_cast<uint16_t>(validFullHeaders[i]);
+        const uint8_t pktType =
+            extractAqlBits(hdr, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
+        const uint8_t amdFormat = static_cast<uint8_t>((validFullHeaders[i] >> 16) & 0xFF);
+        if (pktType == HSA_PACKET_TYPE_KERNEL_DISPATCH ||
+            (pktType == HSA_PACKET_TYPE_VENDOR_SPECIFIC &&
+             amdFormat == HSA_AMD_PACKET_TYPE_EXT_KERNEL_DISPATCH)) {
+          if (ordinal == want) {
+            phi_batch_target = i;
+            break;
+          }
+          ++ordinal;
+        }
+      }
+    }
   }
 
   std::scoped_lock lock(execution());
@@ -2089,6 +2131,24 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
       }
     } else if (isLast && (attach_signal || blocking)) {
       pkt->completion_signal = Barriers().ActiveSignal();
+    } else if (i == phi_batch_target && isKernelDispatch) {
+      // ⭐⭐ THE PHI-ONLY GRAPH SAMPLE. Reached only when `timestamp_ == nullptr`, i.e. the app is
+      // NOT profiling -- exactly the case where the profiled-batch route above is dead. This packet
+      // gets a completion signal and NOTHING else: no Timestamp, no AddProfilingSignal, no HW event
+      // (`phi_detached`), so it carries none of the retained-ProfilingSignal cost that makes the
+      // profiled route expensive. The recycle-point sampler in ActiveSignal() harvests it for free
+      // on the next trip round the signal pool.
+      // ⛔ Must not also carry a pre-patched signal: `phi_batch_target` is only ever an interior
+      // packet, and a pre-patched one would have taken the `prePatchedHandle != 0` arm above --
+      // but that arm needs `timestamp_ != nullptr`, so guard here rather than assume.
+      const auto* hostPkt = reinterpret_cast<const hsa_kernel_dispatch_packet_t*>(
+          flatPacketData.data() + i * kPacketSize);
+      if (!pre_patched || hostPkt->completion_signal.handle == 0) {
+        pkt->completion_signal =
+            Barriers().ActiveSignal(kInitSignalValueOne, /*ts=*/nullptr, /*attach_signal=*/true,
+                                    /*is_dispatch=*/true, /*phi_only=*/false,
+                                    /*phi_detached=*/true);
+      }
     }
     return nullptr;
   };
@@ -2228,13 +2288,18 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
       }
 
       // Per-packet fixups: profiling signals, kernel-name printing, inline barrier logging.
-      if (timestamp_ != nullptr || needKernelNamesReported || kLogBatch) {
+      // ⭐ `phi_batch_target` joins the gate: without it the NT path would skip attachPacketSignal
+      // entirely when the app is not profiling, which is precisely when the Phi sample is needed.
+      const bool phiWantsThisChunk =
+          phi_batch_target != SIZE_MAX && phi_batch_target >= chunkStart &&
+          phi_batch_target < chunkEnd;
+      if (timestamp_ != nullptr || needKernelNamesReported || kLogBatch || phiWantsThisChunk) {
         for (size_t i = chunkStart; i < chunkEnd; ++i) {
           const uint64_t slotIdx = (startIndex + i) & queueMask;
           auto* slot = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(
               queueBase + slotIdx * kPacketSize);
           ProfilingSignal* packetSignal = nullptr;
-          if (timestamp_ != nullptr) {
+          if (timestamp_ != nullptr || i == phi_batch_target) {
             packetSignal = attachPacketSignal(slot, i, i == numPackets - 1);
           }
           if (needKernelNamesReported || kLogBatch) {

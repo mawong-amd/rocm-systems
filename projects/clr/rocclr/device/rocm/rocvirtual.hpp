@@ -281,9 +281,17 @@ class VirtualGPU : public device::VirtualDevice {
     bool Create();
 
     //! Finds a free signal for the upcoming operation
+    //! `phi_only`   -- signal exists ONLY for the estimator; mirror stock's no-signal answer by
+    //!                 CLEARING the command's HW event. Correct on the single-dispatch path, where
+    //!                 stock would have left that command with no HW event at all.
+    //! `phi_detached` -- signal exists only for the estimator and belongs to NO command: touch
+    //!                 `gpu_.command()` neither way. ⛔ REQUIRED on the graph batch path, where the
+    //!                 AccumulateCommand legitimately owns a HW event from the last-slot
+    //!                 `ActiveSignal()` a few lines earlier; `phi_only` there would RELEASE it.
     hsa_signal_t ActiveSignal(hsa_signal_value_t init_val = kInitSignalValueOne,
                               Timestamp* ts = nullptr, bool attach_signal = true,
-                             bool is_dispatch = false, bool phi_only = false);
+                             bool is_dispatch = false, bool phi_only = false,
+                             bool phi_detached = false);
 
     //! Wait for the curent active signal. Can idle the queue
     bool WaitCurrent();
@@ -935,6 +943,12 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
   mutable std::atomic<uint64_t> phi_d_skipped_{0};   //!< recycles declined by the is_dispatch tag
+  //! ⭐ ROTATION CURSOR for graph-batch `d` sampling. One Phi-only signal per batch, on a DIFFERENT
+  //! kernel each launch. ⛔ Rotation is not a nicety: a FIXED index sees one kernel of the graph
+  //! forever, and `d` enters `T_q` squared, so a pinned unrepresentative kernel is the failure that
+  //! killed the pre-patched-signal route (unbounded BOTH ways -- 24.4x over, 0.010x under).
+  //! Rotating makes the EWMA converge to the mean over kernels, which is the quantity `T_q` wants.
+  mutable std::atomic<uint32_t> phi_batch_rot_{0};
   //! ⭐⭐ THE TIME BASE FOR `H_q`, AND IT IS FREE. `H_q = sum rho/d = c/W` is a RATE, and
   //! `phi_dispatches_` above is a MONOTONIC COUNT. Without a base a stream that issued a million
   //! dispatches an hour ago and is now idle is indistinguishable from a saturating one -- the same
