@@ -790,15 +790,22 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   // ⭐⭐ BLOCK-MEAN OVER ONE ROTATION PERIOD, before the EWMA sees anything. See the note on
   // `phi_cycle_len_` for why rotation alone aliases against the EWMA (4.40x measured swing on
   // identical work). `L` samples in a row cover every targetable kernel exactly once.
-  const uint64_t L = phi_cycle_len_.load(std::memory_order_relaxed);
+  // ⭐ The period comes from the SIGNAL, not from the vgpu: the sample is harvested long after its
+  // batch, and a stream may replay several graph shapes with different periods.
+  const uint64_t L = sig->phi_cycle_len_;
   if (L > 1) {
-    const uint64_t s = phi_blk_sum_.fetch_add(dur, std::memory_order_relaxed) + dur;
-    const uint64_t n = phi_blk_n_.fetch_add(1, std::memory_order_relaxed) + 1;
+    PhiShapeSlot& slot = PhiShape(L);
+    slot.blk_sum += dur;
+    const uint64_t s = slot.blk_sum;
+    const uint64_t n = ++slot.blk_n;
     if (n < L) {
       // ⛔ A PARTIAL BLOCK MUST NOT READ AS `d == 0`. The selector treats `d == 0` as "no estimate"
       // and a graph-only ring then prices as free, which is the exact failure this whole path
       // exists to avoid. Publish the running partial mean until the first block completes.
-      if (phi_d_ticks_.load(std::memory_order_relaxed) == 0) {
+      // ⭐ Refresh from the partial while NO complete block has ever been folded for this shape --
+      // not merely while `d_ticks == 0`. Otherwise the very first sample pins `d` until a whole
+      // block completes, which for a shape launched fewer than `L` times is never.
+      if (slot.folds == 0) {
         phi_d_ticks_.store(s / n, std::memory_order_relaxed);
       }
       phi_d_samples_.fetch_add(1, std::memory_order_relaxed);
@@ -806,13 +813,13 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
       return;
     }
     dur = s / n;
-    phi_blk_sum_.store(0, std::memory_order_relaxed);
-    phi_blk_n_.store(0, std::memory_order_relaxed);
+    slot.blk_sum = 0;
+    slot.blk_n = 0;
     // ⛔ SEED THE EWMA FROM THE FIRST COMPLETE BLOCK, not from the partial mean published above --
     // otherwise the partial (which is phase-biased by construction) anchors the EWMA and it reads
     // ~15% high. `seed_ewma` below, NOT a reset of phi_d_samples_: that reset made `samples` stop
     // being a raw count of what was folded in, which is what the readout and every scorer assume.
-    seed_ewma = (phi_blk_folds_.fetch_add(1, std::memory_order_relaxed) == 0);
+    seed_ewma = (slot.folds++ == 0);
   }
   // EWMA, 1/8 weight, integer. Seeded by the first sample so it does not crawl up from zero.
   // ⛔ Written WITHOUT a subtraction on purpose. The natural form
@@ -845,14 +852,14 @@ void VirtualGPU::HwQueueTracker::PhiSweepCompleted() {
     }
     // ⭐ Everything older than the first already-harvested slot was taken on a previous sweep, so
     // stopping here makes the amortised cost O(new samples) rather than O(pool size).
-    if (sig->phi_harvested_) {
+    if (sig->phi_harvested_.load(std::memory_order_relaxed)) {
       break;
     }
     // ⛔ NON-BLOCKING. Still running => leave it; the recycle path or a later sweep will get it.
     if (Hsa::signal_load_relaxed(sig->signal_) > 0) {
       continue;
     }
-    sig->phi_harvested_ = true;
+    sig->phi_harvested_.store(true, std::memory_order_relaxed);
     if (sig->phi_is_dispatch_) {
       gpu_.PhiSampleDuration(sig);
     } else {
@@ -923,13 +930,13 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
     // discriminates at all rather than being permanently true.
     if (gpu_.dev().PhiActive()) {
       ProfilingSignal* rec = signal_list_[current_id_];
-      if (rec->phi_harvested_) {
+      if (rec->phi_harvested_.load(std::memory_order_relaxed)) {
         // already taken by the drain-point sweep; counting it again would double-weight one packet
       } else if (rec->phi_is_dispatch_) {
-        rec->phi_harvested_ = true;
+        rec->phi_harvested_.store(true, std::memory_order_relaxed);
         gpu_.PhiSampleDuration(rec);
       } else {
-        rec->phi_harvested_ = true;
+        rec->phi_harvested_.store(true, std::memory_order_relaxed);
         gpu_.PhiCountSkipped();
       }
     }
@@ -990,7 +997,8 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
   Hsa::signal_silent_store_relaxed(prof_signal->signal_, init_val);
   prof_signal->flags_.done_ = false;
   prof_signal->phi_is_dispatch_ = is_dispatch;  // describes THIS use, read back at the next recycle
-  prof_signal->phi_harvested_ = false;          // cleared on arm; set by whichever harvest gets it
+  prof_signal->phi_harvested_.store(false, std::memory_order_relaxed);  // set by whichever harvest gets it
+  prof_signal->phi_cycle_len_ = 0;  // ⛔ clear: a recycled signal must not inherit a stale shape
   prof_signal->engine_ = engine_;
   prof_signal->ReleaseOrderingEdge();
   prof_signal->ResetCachedTiming();
@@ -1998,6 +2006,7 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
   // ⛔ LOCAL, not a member: this block runs BEFORE `std::scoped_lock lock(execution())` below, so
   // member state here would be a cross-stream race on a shared vgpu.
   size_t phi_batch_target = SIZE_MAX;
+  uint64_t phi_eligible = 0;  // rotation period of THIS batch; carried on the signal we arm
   if (dev().PhiActive()) {
     uint64_t kernel_packets = 0;
     uint64_t eligible = 0;  // kernel packets that are actually TARGETABLE (i.e. not the last)
@@ -2034,14 +2043,16 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
     // of `eligible` CONSECUTIVE samples visits every targetable kernel exactly once, so its mean is
     // a STRATIFIED sample of the graph no matter where the block starts. That is what removes the
     // rotation-vs-EWMA aliasing identically rather than statistically.
-    phi_cycle_len_.store(eligible, std::memory_order_relaxed);
+    phi_eligible = eligible;
     // ⛔ Modulus is `eligible`, NOT `kernel_packets`. They differ whenever the LAST packet is a
     // kernel -- the usual case -- and using the larger one meant `want` could name a kernel the
     // search below can never reach, so that launch sampled NOTHING and the final kernel was never
     // sampled at all. Visible as a truth of 20,025 over 63 targetable kernels against 20,305 over
     // all 64.
     if (eligible > 0 && numPackets > 1) {
-      const uint32_t rot = phi_batch_rot_.fetch_add(1, std::memory_order_relaxed);
+      // ⛔ PER-SHAPE cursor. One cursor per vgpu does not describe a stream that replays graphs of
+      // different sizes, and the block-mean built on it is then malformed.
+      const uint64_t rot = PhiShape(eligible).rot.fetch_add(1, std::memory_order_relaxed);
       const uint64_t want = rot % eligible;  // rotate over TARGETABLE kernels
       uint64_t ordinal = 0;
       for (size_t i = 0; i + 1 < numPackets; ++i) {  // exclude the final packet
@@ -2228,6 +2239,11 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
             Barriers().ActiveSignal(kInitSignalValueOne, /*ts=*/nullptr, /*attach_signal=*/true,
                                     /*is_dispatch=*/true, /*phi_only=*/false,
                                     /*phi_detached=*/true);
+        // Carry this batch's rotation period on the signal so the block-mean can find the right
+        // per-shape slot when the sample is harvested, arbitrarily later.
+        if (ProfilingSignal* ps = Barriers().GetLastSignal()) {
+          ps->phi_cycle_len_ = static_cast<uint32_t>(phi_eligible);
+        }
       }
     }
     return nullptr;
@@ -2360,12 +2376,8 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
     // Core path to publish headers
     if (!use_movdir64b) {
       // Non-temporal publish: signals patched in place, then armed headers
-      // Attach signal to the last packet when requested (before per-packet logging).
       auto* lastSlotPtr = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(
           queueBase + ((startIndex + chunkEnd - 1) & queueMask) * kPacketSize);
-      if (isLastChunk && (attach_signal || blocking) && timestamp_ == nullptr) {
-        lastSlotPtr->completion_signal = Barriers().ActiveSignal();
-      }
 
       // Per-packet fixups: profiling signals, kernel-name printing, inline barrier logging.
       // ⭐ `phi_batch_target` joins the gate: without it the NT path would skip attachPacketSignal
@@ -2386,6 +2398,18 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
             reportBatchPacket(i, slotIdx, packetSignal);
           }
         }
+      }
+
+      // ⛔⛔ THE TAIL SIGNAL IS ACQUIRED **AFTER** THE PER-PACKET LOOP, NOT BEFORE IT. Whichever
+      // ActiveSignal() runs last is the one GetLastSignal()/WaitCurrent() describe, and callers use
+      // those to mean "the tail of this batch". Acquiring it first meant an interior Phi packet
+      // became the tracker's current signal, so a wait on the batch would have returned when the
+      // MIDDLE of it completed. It was latent only because `attach_signal` was 0 in 100% of
+      // witnessed batches -- a property of our probes, not of production, and
+      // "structurally invisible in our data, live in production" is the sentence that has already
+      // cost this campaign twice.
+      if (isLastChunk && (attach_signal || blocking) && timestamp_ == nullptr) {
+        lastSlotPtr->completion_signal = Barriers().ActiveSignal();
       }
 
       // Ordering point: drain all preceding NT body writes from the WC buffer

@@ -970,27 +970,71 @@ class VirtualGPU : public device::VirtualDevice {
   //! forever, and `d` enters `T_q` squared, so a pinned unrepresentative kernel is the failure that
   //! killed the pre-patched-signal route (unbounded BOTH ways -- 24.4x over, 0.010x under).
   //! Rotating makes the EWMA converge to the mean over kernels, which is the quantity `T_q` wants.
-  //! ⛔ Rotating ALONE is not sufficient -- see the block-mean below.
-  mutable std::atomic<uint32_t> phi_batch_rot_{0};
+  //! ⛔ Rotating ALONE is not sufficient, and the cursor must be PER SHAPE -- see below.
   //! ⛔⛔ THE BLOCK-MEAN, AND IT IS NOT AN OPTIMISATION -- IT CLOSES AN ALIASING DEFECT. The cursor
-  //! walks the graph with period `phi_cycle_len_` while the EWMA remembers ~8 samples. When kernel
+  //! walks the graph with period `eligible` while the EWMA remembers ~8 samples. When kernel
   //! duration is CORRELATED WITH INDEX AT LOW FREQUENCY (first half cheap, second half dear) the
   //! EWMA tracks whichever half the cursor is in: MEASURED 33,067 vs 7,518 ticks on IDENTICAL work,
   //! a 4.40x swing decided by nothing but how many launches had happened -- and `d` enters `T_q`
-  //! SQUARED, so 19.4x in the Phi term.
-  //! ⭐ The repair: average one FULL rotation period, then fold that mean into the EWMA. A block of
-  //! `cycle_len` consecutive samples visits every targetable kernel exactly once, so it is a
-  //! STRATIFIED sample regardless of phase -- the index-correlation term goes identically, not
-  //! statistically. Swing 4.40x -> 1.002x, and 3% MORE accurate on the alternating case too.
-  //! ⛔ Hashing the index instead only reaches 1.46x: randomising is not stratifying, because a hash
-  //! of a counter is still a deterministic sequence and the EWMA still sees only 8 of them.
-  //! ⛔⛔ The alternating (period-2) case the original commit validated with is the ONE pattern this
-  //! aliasing CANNOT bite -- the EWMA averages consecutive alternating samples perfectly. Never
-  //! re-validate this with an alternating graph alone; use an index-correlated one.
-  mutable std::atomic<uint64_t> phi_cycle_len_{1};   //!< rotation period = targetable kernels/batch
-  mutable std::atomic<uint64_t> phi_blk_sum_{0};     //!< running sum of the current block
-  mutable std::atomic<uint64_t> phi_blk_n_{0};       //!< samples in the current block
-  mutable std::atomic<uint64_t> phi_blk_folds_{0};   //!< completed blocks folded into the EWMA
+  //! SQUARED, so 19.4x in the Phi term. Averaging one FULL period first makes each fold a
+  //! STRATIFIED sample of the whole graph regardless of phase.
+  //! ⛔ Hashing the index instead only reaches 1.46x: randomising is not stratifying.
+  //! ⛔⛔ The alternating (period-2) case the first version validated with is the ONE pattern this
+  //! aliasing CANNOT bite. Never re-validate with an alternating graph, or a single shape.
+  //!
+  //! ⛔⛔⛔ AND THE STATE MUST BE PER SHAPE, NOT PER STREAM. A single `cycle_len` per vgpu was the
+  //! first version's defect: a stream replaying a 64-kernel graph and a 32-kernel graph has no one
+  //! rotation period, the blocks are malformed, and the 4.40x aliasing comes straight back -- in
+  //! exactly production's geometry, where vLLM keeps one hipGraph per batch-size bucket and replays
+  //! them on one stream. Slots are direct-mapped by `eligible` and reset on key mismatch; a
+  //! collision between two shapes costs one discarded block, never a mixed one.
+  //! ⛔⛔ SLOTS ARE LINEAR-PROBED, NOT DIRECT-MAPPED, AND THAT IS NOT A REFINEMENT. Direct mapping
+  //! by `eligible % kPhiShapes` collides: a 64-kernel graph and a 32-kernel graph give
+  //! `63 % 4 == 31 % 4 == 3`. Two colliding shapes ALTERNATING on one stream flip the key every
+  //! launch, so the block resets every launch, NO block ever completes, and `d` freezes at an early
+  //! partial -- MEASURED 6,200-6,440 ticks against ~20,000 for either shape alone, a 3.2x
+  //! under-estimate, which is the MERGE direction and therefore the unsafe one. Probing gives every
+  //! distinct shape its own slot while there is room.
+  static constexpr size_t kPhiShapes = 8;
+  struct PhiShapeSlot {
+    std::atomic<uint64_t> key{0};  //!< `eligible` this slot tracks; 0 = free
+    std::atomic<uint64_t> rot{0};  //!< rotation cursor for THIS shape
+    //! Block state below is touched ONLY by PhiSampleDuration, single-threaded per vgpu (it runs
+    //! under execution() on every path), so it needs no atomics -- and the non-atomic
+    //! read-modify-write is bounded anyway: `sum/n` always lies inside the block's own min/max.
+    uint64_t blk_sum = 0;
+    uint64_t blk_n = 0;
+    uint64_t folds = 0;
+  };
+  mutable PhiShapeSlot phi_shapes_[kPhiShapes];
+
+  //! Slot for `eligible`: return the existing one, else claim a free one, else (table full) evict
+  //! the home slot. Eviction costs that shape its partial block, never a MIXED block.
+  PhiShapeSlot& PhiShape(uint64_t eligible) const {
+    const size_t home = static_cast<size_t>(eligible % kPhiShapes);
+    for (size_t i = 0; i < kPhiShapes; ++i) {
+      PhiShapeSlot& s = phi_shapes_[(home + i) % kPhiShapes];
+      const uint64_t k = s.key.load(std::memory_order_relaxed);
+      if (k == eligible) {
+        return s;
+      }
+      if (k == 0) {
+        s.key.store(eligible, std::memory_order_relaxed);
+        s.rot.store(0, std::memory_order_relaxed);
+        s.blk_sum = 0;
+        s.blk_n = 0;
+        s.folds = 0;
+        return s;
+      }
+    }
+    PhiShapeSlot& s = phi_shapes_[home];
+    s.key.store(eligible, std::memory_order_relaxed);
+    s.rot.store(0, std::memory_order_relaxed);
+    s.blk_sum = 0;
+    s.blk_n = 0;
+    s.folds = 0;
+    return s;
+  }
   //! ⭐⭐ THE TIME BASE FOR `H_q`, AND IT IS FREE. `H_q = sum rho/d = c/W` is a RATE, and
   //! `phi_dispatches_` above is a MONOTONIC COUNT. Without a base a stream that issued a million
   //! dispatches an hour ago and is now idle is indistinguishable from a saturating one -- the same

@@ -75,7 +75,11 @@ class ProfilingSignal : public amd::ReferenceCountedObject {
   //! ⭐ True once the `d` estimator has taken this signal's timing, so the recycle-point harvest and
   //! the drain-point sweep cannot double-count the same packet. Defaults TRUE: a signal nobody armed
   //! for Phi must never look like an unharvested sample.
-  bool phi_harvested_ = true;
+  std::atomic<bool> phi_harvested_{true};
+  //! ⭐ The rotation period (targetable kernels) of the BATCH this signal was armed for. The sample
+  //! is harvested long after the batch, so the block-mean cannot know the shape unless the signal
+  //! carries it. 0 = not a rotating graph sample.
+  uint32_t phi_cycle_len_ = 0;
   std::recursive_mutex lock_;  //!< Signal lock for update
 
   typedef union {
