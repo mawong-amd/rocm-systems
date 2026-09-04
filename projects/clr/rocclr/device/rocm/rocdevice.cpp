@@ -19,6 +19,10 @@
 #include "device/comgrctx.hpp"
 #include "device/devhostcall.hpp"
 #include "device/rocm/rocdevice.hpp"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "device/rocm/rocblit.hpp"
 #include "device/rocm/rocvirtual.hpp"
 #include "device/rocm/rocprogram.hpp"
@@ -728,8 +732,13 @@ bool Device::create() {
   // silently break -- and breaking it reallocates a vector under concurrent writers, which is the
   // same use-after-free class the slot array was introduced to fix.
   if (PhiShadow()) {
-    phi_trace_sel_.resize(kPhiTraceSel);
-    phi_trace_selq_.resize(kPhiTraceSelQ);
+    // Prefer the signal-survivable mmap sink; fall back to the heap ring when unconfigured.
+    if (!PhiTraceMapOpen()) {
+      phi_trace_sel_.resize(kPhiTraceSel);
+      phi_trace_selq_.resize(kPhiTraceSelQ);
+      phi_sel_buf_ = phi_trace_sel_.data();
+      phi_selq_buf_ = phi_trace_selq_.data();
+    }
   }
 
   if (!ValidateComgr()) {
@@ -3409,12 +3418,61 @@ void Device::getHwEventTime(const amd::Event& event, uint64_t* start, uint64_t* 
 }
 
 // ================================================================================================
+// ⭐ Signal-survivable trace sink. MEASURED: with a heap ring dumped from ~Device, a mid-run SIGTERM
+// loses the ENTIRE trace (SELSUM=0, SEL=0), as does SIGKILL, while a clean exit gives SELSUM=1.
+// SIGTERM is how a server is normally stopped, so even a graceful shutdown lost everything -- and
+// under vLLM's multiprocess executor ~Device may not run at all.
+// ⛔ The decision path is UNCHANGED: appends remain a store to mapped memory. No msync, no syscall,
+// no lock. (msync would only guard against a machine crash, which is not the threat here.)
+bool Device::PhiTraceMapOpen() const {
+  const char* dir = getenv("DEBUG_CLR_PHI_TRACE");
+  if (dir == nullptr || dir[0] == '\0') {
+    return false;  // unconfigured: fall back to the heap ring + teardown dump
+  }
+  const size_t len = sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec) +
+                     kPhiTraceSelQ * sizeof(PhiSelQRec);
+  // ⭐ pid AND device index in the name. Eight TP ranks are eight PROCESSES with eight independent
+  // `seq` counters; pooling them is a scorer bug that separate files make impossible.
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/t313trace.%d.%u.bin", dir, static_cast<int>(getpid()),
+           static_cast<unsigned>(index()));
+  const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    return false;
+  }
+  if (ftruncate(fd, static_cast<off_t>(len)) != 0) {
+    close(fd);
+    return false;
+  }
+  void* m = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);  // the mapping keeps the file alive
+  if (m == MAP_FAILED) {
+    return false;
+  }
+  phi_map_ = m;
+  phi_map_len_ = len;
+  phi_hdr_ = static_cast<PhiTraceHdr*>(m);
+  phi_hdr_->magic = 0x4e435254333133ull;
+  phi_hdr_->version = 1;
+  phi_hdr_->sel_cap = kPhiTraceSel;
+  phi_hdr_->selq_cap = kPhiTraceSelQ;
+  phi_hdr_->sel_n = 0;
+  phi_hdr_->selq_n = 0;
+  phi_hdr_->pid = static_cast<uint64_t>(getpid());
+  phi_hdr_->dev = index();
+  phi_sel_buf_ = reinterpret_cast<PhiSelRec*>(static_cast<char*>(m) + sizeof(PhiTraceHdr));
+  phi_selq_buf_ = reinterpret_cast<PhiSelQRec*>(
+      static_cast<char*>(m) + sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec));
+  return true;
+}
+
+// ================================================================================================
 // Format and emit the whole shadow trace, ONCE, at device teardown -- so the decision path itself
 // does no formatting and no I/O. See the ring note in the header for why.
 void Device::PhiTraceDump() const {
   const uint64_t sn = phi_trace_sel_n_.load(std::memory_order_relaxed);
   const uint64_t qn = phi_trace_selq_n_.load(std::memory_order_relaxed);
-  if (sn == 0 || phi_trace_sel_.empty()) {
+  if (sn == 0 || phi_sel_buf_ == nullptr) {
     return;
   }
   // ⚠️ Report the drop explicitly. A ring that silently keeps only its tail makes a truncated
@@ -3431,7 +3489,7 @@ void Device::PhiTraceDump() const {
           (unsigned long)phi_body_max_.load(std::memory_order_relaxed),
           phi_slot_hi_.load(std::memory_order_relaxed), (unsigned long)PhiSlotOverflow());
   for (uint64_t i = sdrop; i < sn; ++i) {
-    const PhiSelRec& r = phi_trace_sel_[i % kPhiTraceSel];
+    const PhiSelRec& r = phi_sel_buf_[i % kPhiTraceSel];
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "T313SEL seq=%lu via=%s cands=%u free=%u meas=%u mult_w=%u mult_u=%u eval_w=%d "
             "eval_u=%d stock=%lu phi_w=%lu phi_u=%lu agree_w=%d agree_u=%d wu_same=%d",
@@ -3441,7 +3499,7 @@ void Device::PhiTraceDump() const {
             (unsigned long)r.phi_u, (int)r.agree_w, (int)r.agree_u, (int)r.wu_same);
   }
   for (uint64_t i = qdrop; i < qn; ++i) {
-    const PhiSelQRec& q = phi_trace_selq_[i % kPhiTraceSelQ];
+    const PhiSelQRec& q = phi_selq_buf_[i % kPhiTraceSelQ];
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "T313SELQ seq=%lu q=%lu n=%u nunk=%u rc=%u ded=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
             (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, q.rc, (unsigned)q.ded,
@@ -3601,12 +3659,13 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     // non-excluded and falls back, logging "(excluded-fallback)"), so returning silently makes
     // #T313SEL != #decisions with nothing to indicate it. Rare, but an undercount that looks like a
     // complete census is exactly the failure mode this trace exists to avoid.
-    if (phi_trace_sel_.empty()) {
+    if (phi_sel_buf_ == nullptr) {
       note_cost();
       return;  // trace not allocated (see Device::create); never resize on the decision path
     }
-    PhiSelRec& e = phi_trace_sel_[phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed) %
-                                 kPhiTraceSel];
+    const uint64_t ei = phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed);
+    if (phi_hdr_ != nullptr) phi_hdr_->sel_n = ei + 1;
+    PhiSelRec& e = phi_sel_buf_[ei % kPhiTraceSel];
     e = PhiSelRec{};
     e.seq = seq;
     e.stock = (stock_choice != nullptr) ? stock_choice->id : 0;
@@ -3699,12 +3758,16 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   const uint64_t stock_id = (stock_choice != nullptr) ? stock_choice->id : 0;
   // ⭐ Append only. No formatting, no I/O, no lock, NO ALLOCATION -- see the note on the ring in
   // the header and the eager reserve in Device::create.
-  if (phi_trace_sel_.empty()) {
+  // ⛔ Test the BUFFER, not the vector. With the mmap sink active the vector is deliberately empty
+  // -- the buffer aliases the mapping -- and a guard on `phi_trace_sel_.empty()` therefore made
+  // every report bail out and the trace file read `decisions=0` while the code looked correct.
+  if (phi_sel_buf_ == nullptr || phi_selq_buf_ == nullptr) {
     note_cost();
     return;
   }
   const uint64_t si = phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed);
-  PhiSelRec& r = phi_trace_sel_[si % kPhiTraceSel];
+  if (phi_hdr_ != nullptr) phi_hdr_->sel_n = si + 1;  // published as we go, not at teardown
+  PhiSelRec& r = phi_sel_buf_[si % kPhiTraceSel];
   r.seq = seq;
   r.stock = stock_id;
   r.phi_w = eval_w ? cands[best_w].q->id : 0;
@@ -3722,7 +3785,8 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   r.mult_u = mult_u;
   for (const auto& c : cands) {
     const uint64_t qi = phi_trace_selq_n_.fetch_add(1, std::memory_order_relaxed);
-    PhiSelQRec& qr = phi_trace_selq_[qi % kPhiTraceSelQ];
+    if (phi_hdr_ != nullptr) phi_hdr_->selq_n = qi + 1;
+    PhiSelQRec& qr = phi_selq_buf_[qi % kPhiTraceSelQ];
     qr.seq = seq;
     qr.q = c.q->id;
     qr.n = c.n;

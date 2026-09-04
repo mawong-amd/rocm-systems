@@ -1018,8 +1018,31 @@ class Device : public NullDevice {
   };
   static constexpr size_t kPhiTraceSel = 1u << 16;   //!< 64 Ki decisions   (~2.6 MB)
   static constexpr size_t kPhiTraceSelQ = 1u << 18;  //!< 256 Ki candidates (~10 MB)
+  //! ⛔⛔ THE TRACE MUST SURVIVE A SIGNAL. MEASURED: with the ring in heap memory and dumped from
+  //! ~Device, a mid-run **SIGTERM** loses the ENTIRE trace (SELSUM=0, SEL=0), as does SIGKILL,
+  //! while a clean exit yields SELSUM=1. SIGTERM matters because that is how a server is normally
+  //! stopped -- so even a GRACEFUL shutdown lost everything, and under vLLM's multiprocess executor
+  //! ~Device may not run at all.
+  //! ⭐ When `DEBUG_CLR_PHI_TRACE` names a directory, the rings are backed by an mmap'd file
+  //! instead. Records land in the page cache as they are written, so nothing is lost to a signal,
+  //! and the decision path pays exactly what it paid before -- a store to mapped memory.
+  //! ⭐ One file per PROCESS and device, named with the pid: eight TP ranks are eight processes with
+  //! eight independent `seq` counters, and a scorer that pools them across ranks is wrong. Separate
+  //! files make that mistake impossible rather than merely documented.
   mutable std::vector<PhiSelRec> phi_trace_sel_;
   mutable std::vector<PhiSelQRec> phi_trace_selq_;
+  //! Non-null when the mmap sink is active; these alias the mapping, not the vectors.
+  mutable PhiSelRec* phi_sel_buf_ = nullptr;
+  mutable PhiSelQRec* phi_selq_buf_ = nullptr;
+  mutable void* phi_map_ = nullptr;
+  mutable size_t phi_map_len_ = 0;
+  //! File header, mapped at offset 0, so a reader knows what it has without our process.
+  struct PhiTraceHdr {
+    uint64_t magic, version, sel_cap, selq_cap, sel_n, selq_n, pid, dev;
+  };
+  mutable PhiTraceHdr* phi_hdr_ = nullptr;
+  //! Open the mmap sink if DEBUG_CLR_PHI_TRACE is set. Returns false to fall back to the heap ring.
+  bool PhiTraceMapOpen() const;
   mutable std::atomic<uint64_t> phi_trace_sel_n_{0};
   mutable std::atomic<uint64_t> phi_trace_selq_n_{0};
   mutable std::atomic<uint64_t> phi_body_ticks_{0};  //!< PHI=3 only: summed shadow-body duration
