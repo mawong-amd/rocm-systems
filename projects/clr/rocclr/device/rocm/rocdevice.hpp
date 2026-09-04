@@ -847,19 +847,50 @@ class Device : public NullDevice {
   };
   mutable PhiStats phi_stats_;
 
+  //! ⭐ THE CONCURRENCY WITNESS. A `d` sample taken while this stream's ring is SHARED is
+  //! uninflated -- ring serialisation means the kernel ran alone (MEASURED: 4 merged streams read
+  //! 448-451k against a 449,844 solo reference). A sample taken while the stream has its ring to
+  //! ITSELF may be inflated by cross-ring CU concurrency, upward, by up to ~3.5x. So the ring's
+  //! share count at sample time decides whether a reading is trustworthy, and it must be a
+  //! MEASURED FIELD rather than an argument.
+  //! Mirrored lock-free here because the sampler runs under execution(), and reaching for
+  //! `active_queue_access_` there would create a new lock edge on the dispatch path.
+  //! Indexed by `id % numHwPipes_` -- at cap <= numHwPipes_ that IS the ring identity, and it is
+  //! the same coordinate the selector will use.
+  static constexpr uint32_t kPhiMaxRings = 8;
+  mutable std::atomic<uint32_t> phi_ring_binds_[kPhiMaxRings] = {};
+
+ public:
+  void PhiRingBind(hsa_queue_t* q, int delta) const {
+    if (q == nullptr || numHwPipes_ == 0) return;
+    const uint32_t r = static_cast<uint32_t>(q->id % numHwPipes_) % kPhiMaxRings;
+    if (delta > 0) phi_ring_binds_[r].fetch_add(1, std::memory_order_relaxed);
+    else phi_ring_binds_[r].fetch_sub(1, std::memory_order_relaxed);
+  }
+  //! Streams currently bound to the ring `q` sits on. 1 == this stream has it to itself.
+  uint32_t PhiRingShare(hsa_queue_t* q) const {
+    if (q == nullptr || numHwPipes_ == 0) return 0;
+    const uint32_t r = static_cast<uint32_t>(q->id % numHwPipes_) % kPhiMaxRings;
+    return phi_ring_binds_[r].load(std::memory_order_relaxed);
+  }
+
+ private:
+
   //! ⭐ Per-stream estimator snapshots, deposited by ~VirtualGPU. ⛔ Printing only from
   //! ~VirtualGPU misses every stream the program never destroyed; printing only from ~Device
   //! misses ALL of them, because `vgpus_` is already empty by then (verified: the device line
   //! prints, the per-stream lines do not). The union of the two covers both.
-  struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, samples, rejected; };
+  struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, d_min, d_min_shared, samples,
+                           shared, rejected; };
   mutable std::vector<PhiStreamSnapshot> phi_streams_;
   mutable amd::Monitor phi_streams_lock_;
 
  public:
-  void PhiRecordStream(uint64_t dispatches, uint64_t d_ticks, uint64_t samples,
+  void PhiRecordStream(uint64_t dispatches, uint64_t d_ticks, uint64_t d_min,
+                       uint64_t d_min_shared, uint64_t samples, uint64_t shared,
                        uint64_t rejected) const {
     amd::ScopedLock l(phi_streams_lock_);
-    phi_streams_.push_back({dispatches, d_ticks, samples, rejected});
+    phi_streams_.push_back({dispatches, d_ticks, d_min, d_min_shared, samples, shared, rejected});
   }
 
  private:

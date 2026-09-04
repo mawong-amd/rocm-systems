@@ -911,6 +911,7 @@ class VirtualGPU : public device::VirtualDevice {
   //! only `phi_dispatches_` -- a counter, no timestamps, no sampling, no bias. Only T_q needs `d`.
   //! const + mutable: the tracker holds `gpu_` by const reference, and this is
   //! accounting/estimator state rather than observable queue state.
+  uint32_t gpu_device_queue_share() const;  //!< streams bound to my ring right now
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
 
   //! ⛔ ATOMIC because slice C will read ANOTHER stream's counters from
@@ -921,6 +922,17 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_ticks_{0};     //!< EWMA of packet duration, agent ticks
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
+  //! ⭐ MINIMUM observed duration. §6e: a sample taken while this stream's ring is SHARED is
+  //! uninflated (serialisation means the kernel ran alone), and every distortion -- cross-ring CU
+  //! concurrency above all -- is UPWARD. So the minimum is the natural estimator of SOLO SERVICE
+  //! DEMAND, which is what Phi's `d` is defined to be, while the EWMA tracks whatever mixture the
+  //! stream happened to run in. Reported beside the EWMA so the two can be compared, not assumed.
+  mutable std::atomic<uint64_t> phi_d_min_ticks_{0};
+  //! ⭐ Same, restricted to samples taken while this stream's ring was SHARED -- the readings §6e
+  //! shows are uninflated. This is the honest estimate of SOLO SERVICE DEMAND; `phi_d_min_ticks_`
+  //! is a lower bound that may still carry cross-ring inflation.
+  mutable std::atomic<uint64_t> phi_d_min_shared_{0};
+  mutable std::atomic<uint64_t> phi_samples_shared_{0};  //!< how many samples were trustworthy
   //! ⭐ `H_q = sum rho/d = c/W` is a RATE, and a monotonic count is not one. Without a time base a
   //! stream that issued a million dispatches an hour ago and is now idle is indistinguishable from
   //! a saturating one -- the same per-binding defect this campaign already retired once. The
