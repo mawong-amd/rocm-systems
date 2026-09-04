@@ -2032,8 +2032,19 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
           flatPacketData.data() + i * kPacketSize);
       const uint64_t prePatchedHandle = pre_patched ? hostPkt->completion_signal.handle : 0;
       if (prePatchedHandle == 0) {
-        pkt->completion_signal =
-            Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, true);
+        // ⭐⭐ GRAPH `d`, FOR FREE. On the PROFILED-BATCH path every packet gets its OWN
+        // completion signal, so start/end bracket exactly one kernel -- a true per-kernel `d`,
+        // not a batch aggregate. This is a CALLER-requested signal (timestamp_ != nullptr), so
+        // tagging it costs nothing: no forcing, no extra signal, no `phi_only` handling.
+        // ⛔ NOT the batch-TAIL signal below (`isLast && attach_signal`), which HANGS when forced
+        // on segmented graphs and does not time one kernel anyway. Different path; keep that one
+        // untagged.
+        // ⚠️ REACH: this path is live only where `timestamp_ != nullptr`, which for graphs means
+        // a node with `signal_is_required_` -- set ONLY on a dependency edge that crosses a stream
+        // segment (hip_graph_internal.cpp:956). A linear single-stream graph has no such edge and
+        // still contributes to H_q only. Segmented graphs, which is what production runs, do.
+        pkt->completion_signal = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, true,
+                                                         /*is_dispatch=*/isKernelDispatch);
         if (isKernelDispatch) {
           if (isBaseKernelDispatch && amd::activity_prof::IsEnabled(OP_ID_DISPATCH)) {
             pkt->reserved2 = timestamp_->command().profilingInfo().correlation_id_;
