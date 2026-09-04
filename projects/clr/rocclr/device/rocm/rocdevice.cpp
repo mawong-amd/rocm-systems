@@ -226,10 +226,11 @@ Device::~Device() {
       for (const auto& v : phi_streams_) {
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
                 "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
-                "win_ticks=%lu",
+                "win_ticks=%lu rate_disp=%lu rate_ticks=%lu",
                 (unsigned long)v.dispatches, (unsigned long)v.d_ticks,
                 (unsigned long)v.samples, (unsigned long)v.rejected,
-                (unsigned long)v.skipped, (unsigned long)v.win);
+                (unsigned long)v.skipped, (unsigned long)v.win, (unsigned long)v.rate_disp,
+                (unsigned long)v.rate_ticks);
       }
     }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,

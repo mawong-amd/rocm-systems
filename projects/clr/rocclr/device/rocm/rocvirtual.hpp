@@ -933,7 +933,7 @@ class VirtualGPU : public device::VirtualDevice {
   //! ⭐ rho/d is EXACTLY the dispatch rate (rho = c*d/W, so rho/d = c/W), so H_q needs no `d`.
   //! ⛔ BUT A RATE IS NOT A COUNT: it needs `phi_dispatches_` AND a time base. This comment used to
   //! claim H_q needed "only `phi_dispatches_` -- a counter, no timestamps"; that was WRONG and
-  //! contradicted the note on the window below. See `phi_d_window_*` for the base and what it costs.
+  //! contradicted the note on the epochs below. See `phi_ep_*` and `PhiRate()`.
   //! const + mutable: the tracker holds `gpu_` by const reference, and this is
   //! accounting/estimator state rather than observable queue state.
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
@@ -943,16 +943,31 @@ class VirtualGPU : public device::VirtualDevice {
   //! Widen the observation window to include `end`.
   //! ⛔⛔ MIN/MAX, NOT FIRST/LAST. Samples do NOT arrive in chronological order: the drain-point
   //! sweep walks the signal pool BACKWARD, so it delivers DECREASING `end` timestamps. A first/last
-  //! window therefore inverts and `PhiWindowTicks()` reads 0 -- MEASURED `win_ticks=0` on every
-  //! deep-backlog run, i.e. the rate was lost in exactly the regime the sweep exists to serve.
+  //! window therefore inverts and the span reads 0 -- MEASURED `win_ticks=0` on every deep-backlog
+  //! run, i.e. the rate was lost in exactly the regime the sweep exists to serve. The epoch start
+  //! is likewise only ever advanced by a STRICTLY LATER `end`.
   void PhiNoteWindow(uint64_t end) const {
-    uint64_t f = phi_d_window_first_.load(std::memory_order_relaxed);
-    if (f == 0 || end < f) {
-      phi_d_window_first_.store(end, std::memory_order_relaxed);
+    const uint64_t last = phi_ep_last_seen_.load(std::memory_order_relaxed);
+    if (end > last) {
+      phi_ep_last_seen_.store(end, std::memory_order_relaxed);
     }
-    uint64_t l = phi_d_window_last_.load(std::memory_order_relaxed);
-    if (end > l) {
-      phi_d_window_last_.store(end, std::memory_order_relaxed);
+    const uint64_t cur = phi_ep_cur_start_.load(std::memory_order_relaxed);
+    if (cur == 0) {
+      const uint64_t d0 = phi_dispatches_.load(std::memory_order_relaxed);
+      phi_ep_cur_start_.store(end, std::memory_order_relaxed);
+      phi_ep_cur_disp_.store(d0, std::memory_order_relaxed);
+      return;
+    }
+    if (end > cur && (end - cur) > kPhiEpochTicks) {
+      // Roll. ⛔ Publish the base BEFORE the start, so a PhiRate() that catches the pair mid-update
+      // sees a `base_disp` that is too OLD (harmless: a slightly low rate) rather than too new
+      // (which underflows the subtraction).
+      phi_ep_prev_disp_.store(phi_ep_cur_disp_.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+      phi_ep_prev_start_.store(cur, std::memory_order_relaxed);
+      phi_ep_cur_disp_.store(phi_dispatches_.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+      phi_ep_cur_start_.store(end, std::memory_order_relaxed);
     }
   }
 
@@ -1040,29 +1055,65 @@ class VirtualGPU : public device::VirtualDevice {
   //! dispatches an hour ago and is now idle is indistinguishable from a saturating one -- the same
   //! per-binding defect this campaign already retired once (idle bound streams counted at full
   //! weight => Phi spreads when it should merge).
-  //! ⭐ These cost NOTHING: `PhiSampleDuration` already reads `end` from the completed signal and
-  //! throws it away. Recording first/last turns it into a window. Same tick domain as `d`, so no
-  //! conversion and no units bug. `rate ~= (samples - 1) / (last_end - first_end)`.
-  //! ⭐⭐ AND IT NEEDS NO RESET POLICY -- which was the whole objection that got `phi_epoch_ns_`
-  //! (a declared-but-never-written field) deleted rather than wired. A window with explicit
-  //! endpoints is self-describing; an epoch is only meaningful relative to a reset convention the
-  //! selector had not chosen yet.
+  //! ⭐ Nearly free: `PhiSampleDuration` already has `end` from the completed signal.
   //! ⛔ WHY IT MATTERS EVEN THOUGH OUR PROBES CANNOT SEE IT: under a COMMON window the missing base
-  //! cancels EXACTLY out of a ring-vs-ring comparison (verified offline: 3,000 randomised trials,
-  //! every apparent flip at relative gap <= 6e-14, i.e. roundoff). Under PER-STREAM windows 25.8%
-  //! of argmins flip. Every stream in our probes starts and stops together, so this defect is
-  //! STRUCTURALLY INVISIBLE in all of our data and live in production, where streams do not.
-  //! ⛔ Consumer not yet written: the selector must use these, not `phi_dispatches_` alone.
-  mutable std::atomic<uint64_t> phi_d_window_first_{0};  //!< `end` of the first sample, ticks
-  mutable std::atomic<uint64_t> phi_d_window_last_{0};   //!< `end` of the most recent sample, ticks
+  //! cancels EXACTLY out of a ring-vs-ring comparison (3,000 randomised trials, every apparent flip
+  //! at relative gap <= 6e-14, i.e. roundoff). Under PER-STREAM windows 25.8% of argmins flip.
+  //! Every stream in our probes starts and stops together, so this is STRUCTURALLY INVISIBLE in all
+  //! of our data and live in production, where streams do not.
+  //! ⛔⛔ THREE THINGS A NAIVE first/last WINDOW GETS WRONG, all biting in the MERGE (unsafe)
+  //! direction, which is why this is epochs and not two timestamps:
+  //!  1. **No dispatch baseline.** `phi_dispatches_` counts from process start, so dividing it by a
+  //!     partial window over-states the rate. Hence `*_disp`, the count AT the epoch start.
+  //!  2. **A window that never forgets.** An idle-then-busy stream averages over all history and
+  //!     under-reports its current rate. Hence epochs that roll.
+  //!  3. **A per-stream right edge.** Using each stream's own last sample makes an IDLE stream's
+  //!     window short and its rate look HIGH. The selector supplies one common `t_ref` for every
+  //!     stream at decision time -- free, and it makes idle streams decay by construction.
+  //! ⭐ TWO epochs, not one: the rate is measured from the PREVIOUS epoch's start, so there is
+  //! always between one and two epochs of history. A single rolling epoch collapses to near-zero
+  //! width right after each roll, the selector reads "unknown", and it flaps.
+  static constexpr uint64_t kPhiEpochTicks = 50000000;  //!< ~50 ms at ~1 tick/ns
+  mutable std::atomic<uint64_t> phi_ep_cur_start_{0};   //!< current epoch start, agent ticks
+  mutable std::atomic<uint64_t> phi_ep_cur_disp_{0};    //!< phi_dispatches_ at that instant
+  mutable std::atomic<uint64_t> phi_ep_prev_start_{0};  //!< previous epoch start = the rate's base
+  mutable std::atomic<uint64_t> phi_ep_prev_disp_{0};
+  mutable std::atomic<uint64_t> phi_ep_last_seen_{0};   //!< newest sample `end`; readout only
 
  public:
-  //! Span of the observation window in agent ticks; 0 when fewer than two samples exist, which the
-  //! caller MUST treat as "rate unknown" rather than dividing by it.
+  //! Now, in the SAME agent-tick domain as `d` and the epochs -- no conversion, no units bug.
+  //! The selector reads this ONCE per decision and shares it across streams.
+  static uint64_t PhiNowTicks();
+
+  //! Dispatch rate over [epoch base, t_ref] as an exact fraction, so no division happens here.
+  //! Returns false for "rate UNKNOWN", which the caller must NOT treat as a rate of zero.
+  bool PhiRate(uint64_t t_ref, uint64_t& disp_delta, uint64_t& tick_delta) const {
+    // ⛔⛔ READ ORDER IS LOAD-BEARING: epoch base FIRST, `phi_dispatches_` SECOND. The other order
+    // lets a concurrent roll install a base NEWER than the count already read, and
+    // `disp_now - base_disp` UNDERFLOWS to ~1e19 -- an infinitely busy stream.
+    uint64_t base_start = phi_ep_prev_start_.load(std::memory_order_relaxed);
+    uint64_t base_disp = phi_ep_prev_disp_.load(std::memory_order_relaxed);
+    if (base_start == 0) {  // fewer than two epochs yet; fall back to the current one
+      base_start = phi_ep_cur_start_.load(std::memory_order_relaxed);
+      base_disp = phi_ep_cur_disp_.load(std::memory_order_relaxed);
+    }
+    const uint64_t disp_now = phi_dispatches_.load(std::memory_order_relaxed);
+    if (base_start == 0 || t_ref <= base_start || disp_now < base_disp) {
+      return false;  // never sampled, no common edge, or a torn pair -- UNKNOWN, never 0
+    }
+    disp_delta = disp_now - base_disp;
+    tick_delta = t_ref - base_start;
+    return true;
+  }
+
+  //! Span of the live observation window in ticks; 0 = unknown. Readout only.
   uint64_t PhiWindowTicks() const {
-    const uint64_t f = phi_d_window_first_.load(std::memory_order_relaxed);
-    const uint64_t l = phi_d_window_last_.load(std::memory_order_relaxed);
-    return (l > f) ? (l - f) : 0;
+    uint64_t base = phi_ep_prev_start_.load(std::memory_order_relaxed);
+    if (base == 0) {
+      base = phi_ep_cur_start_.load(std::memory_order_relaxed);
+    }
+    const uint64_t last = phi_ep_last_seen_.load(std::memory_order_relaxed);
+    return (last > base) ? (last - base) : 0;
   }
 
  private:

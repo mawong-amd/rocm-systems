@@ -757,14 +757,32 @@ bool VirtualGPU::HwQueueTracker::Create() {
 // Units are RAW AGENT TICKS and are never translated: Phi is dimensionless (T carries units of d,
 // H carries 1/d), so a tick->ns conversion would buy nothing and could only introduce error.
 void VirtualGPU::PhiReport() const {
+  // ⭐ Exercise the EXACT reader the selector will use, so the readout can never disagree with the
+  // decision. `rate_disp=0 rate_ticks=0` means UNKNOWN -- which is not a rate of zero.
+  uint64_t rate_disp = 0, rate_ticks = 0;
+  if (!PhiRate(PhiNowTicks(), rate_disp, rate_ticks)) {
+    rate_disp = 0;
+    rate_ticks = 0;
+  }
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu win_ticks=%lu",
+          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
+          "win_ticks=%lu rate_disp=%lu rate_ticks=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_skipped_.load(std::memory_order_relaxed),
-          (unsigned long)PhiWindowTicks());
+          (unsigned long)PhiWindowTicks(), (unsigned long)rate_disp, (unsigned long)rate_ticks);
+}
+
+uint64_t VirtualGPU::PhiNowTicks() {
+  // ⭐ The SAME domain as the AQL dispatch timestamps `d` is built from, so no conversion and no
+  // units bug -- the failure mode a ns/tick mix has already produced twice in this campaign.
+  uint64_t t = 0;
+  if (Hsa::system_get_info(HSA_SYSTEM_INFO_TIMESTAMP, &t) != HSA_STATUS_SUCCESS) {
+    return 0;  // 0 = no common edge; PhiRate() then reports UNKNOWN
+  }
+  return t;
 }
 
 void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
@@ -2826,12 +2844,20 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
 // ================================================================================================
 VirtualGPU::~VirtualGPU() {
   if (dev().settings().queue_phi_ != 0) {
+    // ⭐ Compute the rate HERE, at teardown, with `now` as the common right edge -- the same reader
+    // the selector uses. A stream that went idle long ago must show a decayed rate, not its
+    // lifetime average.
+    uint64_t dep_rate_disp = 0, dep_rate_ticks = 0;
+    if (!PhiRate(PhiNowTicks(), dep_rate_disp, dep_rate_ticks)) {
+      dep_rate_disp = 0;
+      dep_rate_ticks = 0;
+    }
     dev().PhiRecordStream(phi_dispatches_.load(std::memory_order_relaxed),
                           phi_d_ticks_.load(std::memory_order_relaxed),
                           phi_d_samples_.load(std::memory_order_relaxed),
                           phi_d_rejected_.load(std::memory_order_relaxed),
-                          phi_d_skipped_.load(std::memory_order_relaxed),
-                          PhiWindowTicks());
+                          phi_d_skipped_.load(std::memory_order_relaxed), PhiWindowTicks(),
+                          dep_rate_disp, dep_rate_ticks);
   }
 
 

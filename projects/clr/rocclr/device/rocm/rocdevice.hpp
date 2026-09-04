@@ -871,15 +871,18 @@ class Device : public NullDevice {
   //! ~VirtualGPU misses every stream the program never destroyed; printing only from ~Device
   //! misses ALL of them, because `vgpus_` is already empty by then (verified: the device line
   //! prints, the per-stream lines do not). The union of the two covers both.
-  struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, samples, rejected, skipped, win; };
+  struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, samples, rejected, skipped, win,
+                             rate_disp, rate_ticks; };
   mutable std::vector<PhiStreamSnapshot> phi_streams_;
   mutable amd::Monitor phi_streams_lock_;
 
  public:
   void PhiRecordStream(uint64_t dispatches, uint64_t d_ticks, uint64_t samples, uint64_t rejected,
-                       uint64_t skipped, uint64_t win) const {
+                       uint64_t skipped, uint64_t win, uint64_t rate_disp,
+                       uint64_t rate_ticks) const {
     amd::ScopedLock l(phi_streams_lock_);
-    phi_streams_.push_back({dispatches, d_ticks, samples, rejected, skipped, win});
+    phi_streams_.push_back({dispatches, d_ticks, samples, rejected, skipped, win, rate_disp,
+                            rate_ticks});
   }
 
  private:
