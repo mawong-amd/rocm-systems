@@ -3387,6 +3387,125 @@ void Device::getHwEventTime(const amd::Event& event, uint64_t* start, uint64_t* 
 }
 
 // ================================================================================================
+// ⭐ SHADOW MODE. Decide, log, act on nothing. Answers the only question that decides whether any
+// of this ships: does Phi ever disagree with stock in the cap <= numHwPipes_ regime?
+// Phi = sum_rings T_q*H_q with T_q = sum rho*d, H_q = sum rho/d. `rho_m` is a COMMON FACTOR of
+// dPhi_join across candidate rings, so the joiner's own duty cannot change the argmin -- which is
+// what makes this evaluable at BIND time, where a brand-new stream has no rho and never can.
+// With the joiner's own `d` unknown (the bind-time case) the ranking is the d_m -> infinity limit,
+// i.e. argmin H_q: spread, and CLAIM-S-safe by construction.
+// ⛔ TWO rankings are emitted on purpose. `phi_w` is duty-weighted; `phi_u` sets rho == 1 and so
+// ranks by binding, which is what stock's refCount already approximates. The DIFFERENCE between
+// them is the single genuinely new capability, so a null on one must not be read as a null on the
+// other.
+void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
+                             const std::unordered_set<uint64_t>* excluded_ids) const {
+  // ⭐ ONE common right edge for every stream. A per-stream edge makes an IDLE stream's window
+  // short and its rate look HIGH, which is backwards.
+  const uint64_t t_ref = VirtualGPU::PhiNowTicks();
+  // ⛔⛔ EVERY LINE CARRIES ITS OWN DECISION KEY. The per-candidate lines are emitted AFTER their
+  // summary, and a scorer that attaches them by parser state gets it wrong the moment anything
+  // interleaves -- that exact bug (`T313WITQ`) made a POWERED run look unpowered and cost real
+  // time. Key every record from its own line, never from position.
+  const uint64_t seq = phi_sel_seq_.fetch_add(1, std::memory_order_relaxed);
+
+  struct Cand {
+    const hsa_queue_t* q;
+    uint32_t n;      //!< streams bound
+    uint32_t n_unk;  //!< ... of which contributed nothing measurable
+    double Tw, Hw;   //!< duty-weighted aggregates
+    double Tu, Hu;   //!< rho == 1
+  };
+  std::vector<Cand> cands;
+  cands.reserve(queuePool_[qIndex].size());
+
+  for (const auto& entry : queuePool_[qIndex]) {
+    const hsa_queue_t* q = entry.first;
+    if (excluded_ids != nullptr && excluded_ids->count(q->id) > 0) {
+      continue;  // stock would not pick it either; keep the comparison like-for-like
+    }
+    Cand c{q, 0, 0, 0.0, 0.0, 0.0, 0.0};
+    for (const auto* vg : vgpus()) {
+      if (vg == nullptr || vg->gpu_queue() != q) {
+        continue;
+      }
+      ++c.n;
+      uint64_t d = vg->PhiDTicks();
+      uint64_t dd = 0, dt = 0;
+      const bool have_rate = vg->PhiRate(t_ref, dd, dt) && dt > 0;
+      double rho = 1.0;
+      if (d == 0) {
+        // ⛔ `d` UNKNOWN is NEVER `d == 0`: that would price this ring's T_q at zero, i.e. FREE,
+        // and Phi would pile every stream onto it. The only sound bound on an unmeasured `d` is
+        // rho <= 1, i.e. d <= 1/rate, so impute d := 1/rate -- which makes rho exactly 1. It
+        // over-prices, hence spreads, hence is safe under CLAIM S.
+        if (!have_rate || dd == 0) {
+          ++c.n_unk;
+          continue;  // nothing measurable at all; do not invent a contribution
+        }
+        d = static_cast<uint64_t>(static_cast<double>(dt) / static_cast<double>(dd));
+        if (d == 0) {
+          ++c.n_unk;
+          continue;
+        }
+      } else if (have_rate) {
+        const double r = static_cast<double>(dd) / static_cast<double>(dt);
+        rho = r * static_cast<double>(d);
+        if (rho > 1.0) rho = 1.0;  // rho is an occupancy fraction; estimator noise can exceed it
+        if (rho < 0.0) rho = 0.0;
+      }
+      const double dd_f = static_cast<double>(d);
+      c.Tw += rho * dd_f;
+      c.Hw += rho / dd_f;
+      c.Tu += dd_f;
+      c.Hu += 1.0 / dd_f;
+    }
+    cands.push_back(c);
+  }
+  if (cands.empty()) {
+    return;
+  }
+
+  // argmin H_q, which is the d_m -> infinity limit of dPhi_join. A FREE ring has H_q == 0 and wins
+  // outright, which is exactly the hard identity dPhi_join >= rho^2 with equality iff free.
+  size_t best_w = 0, best_u = 0;
+  double max_w = cands[0].Hw, max_u = cands[0].Hu;
+  uint32_t n_free = 0, n_meas = 0;
+  for (size_t i = 0; i < cands.size(); ++i) {
+    if (cands[i].Hw < cands[best_w].Hw) best_w = i;
+    if (cands[i].Hu < cands[best_u].Hu) best_u = i;
+    if (cands[i].Hw > max_w) max_w = cands[i].Hw;
+    if (cands[i].Hu > max_u) max_u = cands[i].Hu;
+    if (cands[i].n == 0) ++n_free;
+    if (cands[i].n > cands[i].n_unk) ++n_meas;
+  }
+  // ⛔⛔ "PHI HAS NO OPINION" IS A DISTINCT OUTCOME AND MUST BE REPORTED AS ONE. When every
+  // candidate ties -- all rings free, or every bound stream still unmeasurable -- argmin returns
+  // index 0 and the ring it names is an artefact of iteration order, not a decision. Scoring those
+  // as disagreements would have reported "Phi disagrees with stock 100% of the time" on a uniform
+  // 6-stream run purely from tie-breaking, which is precisely the check-that-cannot-fail shape this
+  // campaign keeps being bitten by. `eval=0` => `phi_*` and `agree_*` carry NO information; a
+  // scorer must drop those rows, not count them.
+  const bool eval_w = max_w > cands[best_w].Hw;
+  const bool eval_u = max_u > cands[best_u].Hu;
+  const uint64_t stock_id = (stock_choice != nullptr) ? stock_choice->id : 0;
+  ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+          "T313SEL seq=%lu cands=%zu free=%u meas=%u eval_w=%d eval_u=%d stock=%lu phi_w=%lu "
+          "phi_u=%lu agree_w=%d agree_u=%d wu_same=%d",
+          (unsigned long)seq, cands.size(), n_free, n_meas, eval_w ? 1 : 0, eval_u ? 1 : 0, (unsigned long)stock_id,
+          eval_w ? (unsigned long)cands[best_w].q->id : 0UL,
+          eval_u ? (unsigned long)cands[best_u].q->id : 0UL,
+          eval_w ? (cands[best_w].q->id == stock_id ? 1 : 0) : -1,
+          eval_u ? (cands[best_u].q->id == stock_id ? 1 : 0) : -1,
+          (eval_w && eval_u) ? (cands[best_w].q->id == cands[best_u].q->id ? 1 : 0) : -1);
+  for (const auto& c : cands) {
+    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+            "T313SELQ seq=%lu q=%lu n=%u nunk=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
+            (unsigned long)seq, (unsigned long)c.q->id, c.n, c.n_unk, c.Tw, c.Hw, c.Tu, c.Hu);
+  }
+}
+
+// ================================================================================================
 hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
                                       hsa_queue_t* preferred,
                                       const std::unordered_set<uint64_t>* excluded_ids) {
@@ -3430,6 +3549,12 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
           ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
                   "Reusing preferred queue: %p refCount: %d",
                   it->first->base_address, it->second.refCount);
+          // ⭐ Report on the bypass too. This path returns WITHOUT evaluating any metric and is the
+          // DOMINANT one in steady state, so a policy that only replaced the comparator would
+          // barely run -- that fact killed an earlier attempt, and shadow mode must measure it.
+          if (PhiShadow()) {
+            PhiShadowReport(qIndex, it->first, excluded_ids);
+          }
           return it->first;
         }
       }
@@ -3498,6 +3623,9 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
             force_reuse ? " (forced)" : "",
             (excluded_ids && excluded_ids->count(lowest->first->id) > 0)
                 ? " (excluded-fallback)" : "");
+    if (PhiShadow()) {
+      PhiShadowReport(qIndex, lowest->first, excluded_ids);
+    }
     return lowest->first;
   }
   return nullptr;

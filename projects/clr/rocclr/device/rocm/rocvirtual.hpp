@@ -621,6 +621,7 @@ class VirtualGPU : public device::VirtualDevice {
 
   hsa_agent_t gpu_device() const { return gpu_device_; }
   hsa_queue_t* gpu_queue() { return gpu_queue_; }
+  hsa_queue_t* gpu_queue() const { return gpu_queue_; }
 
   //! Set the active HW queue and keep the metadata preloader in sync.
   void SetGpuQueue(hsa_queue_t* queue);
@@ -1105,6 +1106,11 @@ class VirtualGPU : public device::VirtualDevice {
     tick_delta = t_ref - base_start;
     return true;
   }
+
+  //! The stream's contended service interval `d`, in raw agent ticks. 0 = UNKNOWN.
+  //! ⛔ 0 is NOT "instant": a caller that treats it as a duration prices this stream's ring at
+  //! T_q = 0, i.e. FREE, and Phi then piles every other stream onto it.
+  uint64_t PhiDTicks() const { return phi_d_ticks_.load(std::memory_order_relaxed); }
 
   //! Span of the live observation window in ticks; 0 = unknown. Readout only.
   uint64_t PhiWindowTicks() const {

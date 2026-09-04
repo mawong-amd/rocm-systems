@@ -740,6 +740,12 @@ class Device : public NullDevice {
     return settings().queue_phi_ != 0 && settings().max_hw_queues_ <= numHwPipes_;
   }
 
+  //! ⭐ SHADOW: evaluate the policy and LOG what it would have chosen, changing nothing. This is
+  //! how we find out whether the policy has any reach at all before a line of decision code
+  //! exists -- and it is also where the cross-thread read of another stream's counters gets shaken
+  //! out, because here a torn read costs a wrong LOG LINE rather than a wrong placement.
+  bool PhiShadow() const { return PhiActive() && settings().queue_phi_ >= 2; }
+
   //! Returns true if PM4 emulation is enabled
   bool IsPm4Emulation() const { return pm4_emulation_; }
 
@@ -866,6 +872,7 @@ class Device : public NullDevice {
     std::atomic<uint64_t> bypass_preferred{0};//!< returned via the `preferred` hint, selector unused
   };
   mutable PhiStats phi_stats_;
+  mutable std::atomic<uint64_t> phi_sel_seq_{0};  //!< decision key for T313SEL / T313SELQ
 
   //! ⭐ Per-stream estimator snapshots, deposited by ~VirtualGPU. ⛔ Printing only from
   //! ~VirtualGPU misses every stream the program never destroyed; printing only from ~Device
@@ -890,6 +897,11 @@ class Device : public NullDevice {
   std::atomic<uint32_t> num_queues_[QueuePriority::Total] = {};  //!< Per-priority queue counters
 
   //! Use dynamic queues mode to get a queue from pool
+  //! Emit T313SEL: what stock chose vs what Phi would choose, duty-weighted and unweighted.
+  //! ⛔ Must be side-effect free. Called with `active_queue_access_` held.
+  void PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
+                       const std::unordered_set<uint64_t>* excluded_ids) const;
+
   hsa_queue_t* getQueueFromPool(const uint qIndex, bool force_reuse = false,
                                 hsa_queue_t* preferred = nullptr,
                                 const std::unordered_set<uint64_t>* excluded_ids = nullptr);
