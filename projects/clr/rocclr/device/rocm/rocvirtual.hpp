@@ -1016,7 +1016,12 @@ class VirtualGPU : public device::VirtualDevice {
   //! partial -- MEASURED 6,200-6,440 ticks against ~20,000 for either shape alone, a 3.2x
   //! under-estimate, which is the MERGE direction and therefore the unsafe one. Probing gives every
   //! distinct shape its own slot while there is room.
-  static constexpr size_t kPhiShapes = 32;
+  //! ⭐ Sized generously because it is cheap: one slot is 40 B, so 256 slots is ~10 KB per vgpu,
+  //! and the COST OF A LOOKUP DOES NOT SCALE WITH THE TABLE -- the probe is bounded at
+  //! `kPhiProbe`, so a hit is O(1) and a miss is O(16) whatever the capacity. Growing it only buys
+  //! headroom; it cannot make the dispatch path slower.
+  static constexpr size_t kPhiShapes = 256;
+  static constexpr size_t kPhiProbe = 16;
   struct PhiShapeSlot {
     std::atomic<uint64_t> key{0};  //!< `eligible` this slot tracks; 0 = free
     std::atomic<uint64_t> rot{0};  //!< rotation cursor for THIS shape
@@ -1042,8 +1047,12 @@ class VirtualGPU : public device::VirtualDevice {
   //! ⚠️ vLLM keeps one hipGraph per batch-size bucket, so >8 shapes is the expected case, not a
   //! corner: sized for that, and the caller must handle nullptr.
   PhiShapeSlot* PhiShape(uint64_t eligible) const {
-    const size_t home = static_cast<size_t>(eligible % kPhiShapes);
-    for (size_t i = 0; i < kPhiShapes; ++i) {
+    // ⛔ NOT `eligible % kPhiShapes`. Keys are kernel counts -- 31, 63, 127, 255 -- which share
+    // their low bits and so collide hard on a power-of-two modulus, exactly the clustering that
+    // starved the table before. Fibonacci hashing spreads the high bits instead.
+    const size_t home =
+        static_cast<size_t>((eligible * 0x9E3779B97F4A7C15ull) >> 56) % kPhiShapes;
+    for (size_t i = 0; i < kPhiProbe; ++i) {
       PhiShapeSlot& s = phi_shapes_[(home + i) % kPhiShapes];
       const uint64_t k = s.key.load(std::memory_order_relaxed);
       if (k == eligible) {

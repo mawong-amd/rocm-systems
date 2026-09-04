@@ -222,6 +222,7 @@ Device::~Device() {
       for (const auto* vg : vgpus()) {
         if (vg != nullptr) vg->PhiReport();
       }
+      PhiTraceDump();
       amd::ScopedLock l(phi_streams_lock_);
       for (const auto& v : phi_streams_) {
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
@@ -3387,6 +3388,41 @@ void Device::getHwEventTime(const amd::Event& event, uint64_t* start, uint64_t* 
 }
 
 // ================================================================================================
+// Format and emit the whole shadow trace, ONCE, at device teardown -- so the decision path itself
+// does no formatting and no I/O. See the ring note in the header for why.
+void Device::PhiTraceDump() const {
+  const uint64_t sn = phi_trace_sel_n_.load(std::memory_order_relaxed);
+  const uint64_t qn = phi_trace_selq_n_.load(std::memory_order_relaxed);
+  if (sn == 0 || phi_trace_sel_.empty()) {
+    return;
+  }
+  // ⚠️ Report the drop explicitly. A ring that silently keeps only its tail makes a truncated
+  // trace indistinguishable from a complete one, and every rate computed from it is then wrong
+  // with nothing to show for it.
+  const uint64_t sdrop = (sn > kPhiTraceSel) ? (sn - kPhiTraceSel) : 0;
+  const uint64_t qdrop = (qn > kPhiTraceSelQ) ? (qn - kPhiTraceSelQ) : 0;
+  ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+          "T313SELSUM decisions=%lu candidates=%lu dropped_sel=%lu dropped_selq=%lu",
+          (unsigned long)sn, (unsigned long)qn, (unsigned long)sdrop, (unsigned long)qdrop);
+  for (uint64_t i = sdrop; i < sn; ++i) {
+    const PhiSelRec& r = phi_trace_sel_[i % kPhiTraceSel];
+    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+            "T313SEL seq=%lu via=%s cands=%u free=%u meas=%u eval_w=%d eval_u=%d stock=%lu "
+            "phi_w=%lu phi_u=%lu agree_w=%d agree_u=%d wu_same=%d",
+            (unsigned long)r.seq, r.via_bypass ? "bypass" : "metric", r.cands, r.n_free, r.n_meas,
+            (int)r.eval_w, (int)r.eval_u, (unsigned long)r.stock, (unsigned long)r.phi_w,
+            (unsigned long)r.phi_u, (int)r.agree_w, (int)r.agree_u, (int)r.wu_same);
+  }
+  for (uint64_t i = qdrop; i < qn; ++i) {
+    const PhiSelQRec& q = phi_trace_selq_[i % kPhiTraceSelQ];
+    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+            "T313SELQ seq=%lu q=%lu n=%u nunk=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
+            (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, (double)q.Tw, (double)q.Hw,
+            (double)q.Tu, (double)q.Hu);
+  }
+}
+
+// ================================================================================================
 // ⭐ SHADOW MODE. Decide, log, act on nothing. Answers the only question that decides whether any
 // of this ships: does Phi ever disagree with stock in the cap <= numHwPipes_ regime?
 // Phi = sum_rings T_q*H_q with T_q = sum rho*d, H_q = sum rho/d. `rho_m` is a COMMON FACTOR of
@@ -3399,7 +3435,8 @@ void Device::getHwEventTime(const amd::Event& event, uint64_t* start, uint64_t* 
 // them is the single genuinely new capability, so a null on one must not be read as a null on the
 // other.
 void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
-                             const std::unordered_set<uint64_t>* excluded_ids) const {
+                             const std::unordered_set<uint64_t>* excluded_ids,
+                             bool via_bypass) const {
   // ⭐ ONE common right edge for every stream. A per-stream edge makes an IDLE stream's window
   // short and its rate look HIGH, which is backwards.
   // ⭐ Slots publish the rate BASE, not a finished rate, precisely so this edge is applied here and
@@ -3479,14 +3516,27 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
 
   // argmin H_q, which is the d_m -> infinity limit of dPhi_join. A FREE ring has H_q == 0 and wins
   // outright, which is exactly the hard identity dPhi_join >= rho^2 with equality iff free.
-  size_t best_w = 0, best_u = 0;
-  double max_w = cands[0].Hw, max_u = cands[0].Hu;
+  // ⛔⛔ FREE BEATS OCCUPIED STRICTLY, BEFORE ANY H COMPARISON. Ranking on H alone prices an
+  // OCCUPIED ring whose streams are all unmeasurable at H = 0 -- identical to a genuinely free
+  // ring, and it can win. That contradicts the hard identity `dPhi_join >= rho^2` with equality
+  // IFF the ring is free, so it is wrong on the algebra, not merely imprecise. The comparison is
+  // therefore lexicographic: (occupied?, H, unknowns). The last term breaks H-ties toward the ring
+  // we know most about, since an unmeasurable member contributes 0 to H and so UNDER-prices.
+  auto better = [](const Cand& a, const Cand& b, bool weighted) {
+    const bool a_occ = a.n != 0, b_occ = b.n != 0;
+    if (a_occ != b_occ) return !a_occ;                       // free wins outright
+    const double ha = weighted ? a.Hw : a.Hu;
+    const double hb = weighted ? b.Hw : b.Hu;
+    if (ha != hb) return ha < hb;
+    return a.n_unk < b.n_unk;
+  };
+  size_t best_w = 0, best_u = 0, worst_w = 0, worst_u = 0;
   uint32_t n_free = 0, n_meas = 0;
   for (size_t i = 0; i < cands.size(); ++i) {
-    if (cands[i].Hw < cands[best_w].Hw) best_w = i;
-    if (cands[i].Hu < cands[best_u].Hu) best_u = i;
-    if (cands[i].Hw > max_w) max_w = cands[i].Hw;
-    if (cands[i].Hu > max_u) max_u = cands[i].Hu;
+    if (better(cands[i], cands[best_w], true)) best_w = i;
+    if (better(cands[i], cands[best_u], false)) best_u = i;
+    if (better(cands[worst_w], cands[i], true)) worst_w = i;
+    if (better(cands[worst_u], cands[i], false)) worst_u = i;
     if (cands[i].n == 0) ++n_free;
     if (cands[i].n > cands[i].n_unk) ++n_meas;
   }
@@ -3497,22 +3547,42 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   // 6-stream run purely from tie-breaking, which is precisely the check-that-cannot-fail shape this
   // campaign keeps being bitten by. `eval=0` => `phi_*` and `agree_*` carry NO information; a
   // scorer must drop those rows, not count them.
-  const bool eval_w = max_w > cands[best_w].Hw;
-  const bool eval_u = max_u > cands[best_u].Hu;
+  // Evaluable iff some candidate is strictly worse than the best under the SAME order used to
+  // choose, so a tie at the argmin can no longer masquerade as a decision.
+  const bool eval_w = better(cands[best_w], cands[worst_w], true);
+  const bool eval_u = better(cands[best_u], cands[worst_u], false);
   const uint64_t stock_id = (stock_choice != nullptr) ? stock_choice->id : 0;
-  ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-          "T313SEL seq=%lu cands=%zu free=%u meas=%u eval_w=%d eval_u=%d stock=%lu phi_w=%lu "
-          "phi_u=%lu agree_w=%d agree_u=%d wu_same=%d",
-          (unsigned long)seq, cands.size(), n_free, n_meas, eval_w ? 1 : 0, eval_u ? 1 : 0, (unsigned long)stock_id,
-          eval_w ? (unsigned long)cands[best_w].q->id : 0UL,
-          eval_u ? (unsigned long)cands[best_u].q->id : 0UL,
-          eval_w ? (cands[best_w].q->id == stock_id ? 1 : 0) : -1,
-          eval_u ? (cands[best_u].q->id == stock_id ? 1 : 0) : -1,
-          (eval_w && eval_u) ? (cands[best_w].q->id == cands[best_u].q->id ? 1 : 0) : -1);
+  // ⭐ Append only. No formatting, no I/O, no lock -- see the note on the ring in the header.
+  if (phi_trace_sel_.empty()) {
+    phi_trace_sel_.resize(kPhiTraceSel);
+    phi_trace_selq_.resize(kPhiTraceSelQ);
+  }
+  const uint64_t si = phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed);
+  PhiSelRec& r = phi_trace_sel_[si % kPhiTraceSel];
+  r.seq = seq;
+  r.stock = stock_id;
+  r.phi_w = eval_w ? cands[best_w].q->id : 0;
+  r.phi_u = eval_u ? cands[best_u].q->id : 0;
+  r.cands = static_cast<uint32_t>(cands.size());
+  r.n_free = n_free;
+  r.n_meas = n_meas;
+  r.eval_w = eval_w ? 1 : 0;
+  r.eval_u = eval_u ? 1 : 0;
+  r.agree_w = eval_w ? (cands[best_w].q->id == stock_id ? 1 : 0) : -1;
+  r.agree_u = eval_u ? (cands[best_u].q->id == stock_id ? 1 : 0) : -1;
+  r.wu_same = (eval_w && eval_u) ? (cands[best_w].q->id == cands[best_u].q->id ? 1 : 0) : -1;
+  r.via_bypass = via_bypass ? 1 : 0;
   for (const auto& c : cands) {
-    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-            "T313SELQ seq=%lu q=%lu n=%u nunk=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
-            (unsigned long)seq, (unsigned long)c.q->id, c.n, c.n_unk, c.Tw, c.Hw, c.Tu, c.Hu);
+    const uint64_t qi = phi_trace_selq_n_.fetch_add(1, std::memory_order_relaxed);
+    PhiSelQRec& qr = phi_trace_selq_[qi % kPhiTraceSelQ];
+    qr.seq = seq;
+    qr.q = c.q->id;
+    qr.n = c.n;
+    qr.n_unk = c.n_unk;
+    qr.Tw = static_cast<float>(c.Tw);
+    qr.Hw = static_cast<float>(c.Hw);
+    qr.Tu = static_cast<float>(c.Tu);
+    qr.Hu = static_cast<float>(c.Hu);
   }
 }
 
@@ -3564,7 +3634,7 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
           // DOMINANT one in steady state, so a policy that only replaced the comparator would
           // barely run -- that fact killed an earlier attempt, and shadow mode must measure it.
           if (PhiShadow()) {
-            PhiShadowReport(qIndex, it->first, excluded_ids);
+            PhiShadowReport(qIndex, it->first, excluded_ids, /*via_bypass=*/true);
           }
           return it->first;
         }
@@ -3635,7 +3705,7 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
             (excluded_ids && excluded_ids->count(lowest->first->id) > 0)
                 ? " (excluded-fallback)" : "");
     if (PhiShadow()) {
-      PhiShadowReport(qIndex, lowest->first, excluded_ids);
+      PhiShadowReport(qIndex, lowest->first, excluded_ids, /*via_bypass=*/false);
     }
     return lowest->first;
   }

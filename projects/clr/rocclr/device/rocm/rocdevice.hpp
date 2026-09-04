@@ -942,6 +942,38 @@ class Device : public NullDevice {
  private:
   mutable std::atomic<uint64_t> phi_sel_seq_{0};  //!< decision key for T313SEL / T313SELQ
 
+  //! ⛔⛔ WHY A RING AND NOT ClPrint. Emitting the trace inline costs a MEASURED 7,887 ns per
+  //! decision -- a synchronous fprintf+fflush per line, 35x the cost of the computation being
+  //! traced -- plus 824 B/decision. At vLLM dispatch rates that both drowns the log and perturbs
+  //! the very timing the trace is meant to characterise, which would make the measurement a
+  //! measurement of the instrument. Records go to a preallocated ring with a relaxed atomic bump
+  //! and NO I/O on the decision path; the whole thing is formatted once at device teardown.
+  //! ⚠️ A ring KEEPS THE LAST N and counts what it dropped. `phi_trace_drop_` must be reported, not
+  //! silently absorbed -- a truncated trace that looks complete is worse than no trace.
+  //! ⚠️ An unclean kill (SIGKILL of a server) loses the trace entirely. Arrange a clean shutdown.
+  struct PhiSelRec {
+    uint64_t seq, stock, phi_w, phi_u;
+    uint32_t cands, n_free, n_meas;
+    int8_t eval_w, eval_u, agree_w, agree_u, wu_same, via_bypass;
+  };
+  struct PhiSelQRec {
+    uint64_t seq, q;
+    uint32_t n, n_unk;
+    float Tw, Hw, Tu, Hu;
+  };
+  static constexpr size_t kPhiTraceSel = 1u << 16;   //!< 64 Ki decisions   (~2.6 MB)
+  static constexpr size_t kPhiTraceSelQ = 1u << 18;  //!< 256 Ki candidates (~10 MB)
+  mutable std::vector<PhiSelRec> phi_trace_sel_;
+  mutable std::vector<PhiSelQRec> phi_trace_selq_;
+  mutable std::atomic<uint64_t> phi_trace_sel_n_{0};
+  mutable std::atomic<uint64_t> phi_trace_selq_n_{0};
+
+ public:
+  //! Format and emit the whole trace. Called once, at device teardown.
+  void PhiTraceDump() const;
+
+ private:
+
   //! ⭐ Per-stream estimator snapshots, deposited by ~VirtualGPU. ⛔ Printing only from
   //! ~VirtualGPU misses every stream the program never destroyed; printing only from ~Device
   //! misses ALL of them, because `vgpus_` is already empty by then (verified: the device line
@@ -967,8 +999,13 @@ class Device : public NullDevice {
   //! Use dynamic queues mode to get a queue from pool
   //! Emit T313SEL: what stock chose vs what Phi would choose, duty-weighted and unweighted.
   //! ⛔ Must be side-effect free. Called with `active_queue_access_` held.
+  //! `via_bypass` distinguishes the `preferred`-hint path (which returns WITHOUT evaluating any
+  //! metric) from the comparator path. Without it the two are indistinguishable in the trace, and
+  //! a policy that only replaces the comparator would look effective while never running on the
+  //! path that matters.
   void PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
-                       const std::unordered_set<uint64_t>* excluded_ids) const;
+                       const std::unordered_set<uint64_t>* excluded_ids,
+                       bool via_bypass) const;
 
   hsa_queue_t* getQueueFromPool(const uint qIndex, bool force_reuse = false,
                                 hsa_queue_t* preferred = nullptr,
