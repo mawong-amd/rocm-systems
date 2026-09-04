@@ -232,6 +232,13 @@ Device::~Device() {
                 (unsigned long)v.rejected);
       }
     }
+    {  // the per-kernel solo-demand cache, one line per kernel that earned an entry
+      amd::ScopedLock l(phi_kernel_d_lock_);
+      for (const auto& kv : phi_kernel_d_) {
+        ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "T313PHIK kernel=0x%lx d_solo=%lu",
+                (unsigned long)kv.first, (unsigned long)kv.second);
+      }
+    }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "T313PHI mode=%u cap=%u pipes=%u reached=%lu eligible=%lu declined_regime=%lu "
             "bypass_preferred=%lu",
