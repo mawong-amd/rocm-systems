@@ -225,11 +225,9 @@ Device::~Device() {
       amd::ScopedLock l(phi_streams_lock_);
       for (const auto& v : phi_streams_) {
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-                "T313PHIVG dispatches=%lu d_ticks=%lu d_min=%lu d_min_shared=%lu samples=%lu "
-                "shared=%lu rejected=%lu",
-                (unsigned long)v.dispatches, (unsigned long)v.d_ticks, (unsigned long)v.d_min,
-                (unsigned long)v.d_min_shared, (unsigned long)v.samples, (unsigned long)v.shared,
-                (unsigned long)v.rejected);
+                "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
+                (unsigned long)v.dispatches, (unsigned long)v.d_ticks,
+                (unsigned long)v.samples, (unsigned long)v.rejected);
       }
     }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
@@ -3424,7 +3422,6 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
           // "the policy did nothing" and "the policy was never asked" stay distinguishable.
           phi_stats_.bypass_preferred.fetch_add(1, std::memory_order_relaxed);
           it->second.refCount++;
-          PhiRingBind(it->first, +1);  // witness: preferred-hint bind
           ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
                   "Reusing preferred queue: %p refCount: %d",
                   it->first->base_address, it->second.refCount);
@@ -3487,7 +3484,6 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
         });
 
     lowest->second.refCount++;
-    PhiRingBind(lowest->first, +1);  // witness: selector bind
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "Selected queue (mode=%u): %p refCount: %d, depth: %lu, metric: %lu, pipe: %d%s%s",
             mode, lowest->first->base_address, lowest->second.refCount,
@@ -3763,7 +3759,6 @@ hsa_queue_t* Device::acquireQueue(uint32_t queue_size_hint, bool coop_queue,
   assert(result.second && "QueueInfo already exists");
   auto& qInfo = result.first->second;
   qInfo.refCount = 1;
-  PhiRingBind(queue, +1);  // witness: fresh queue
   qInfo.hasDedicatedQueue_ = dedicated_queue;
   populateExtras();
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "acquireQueue refCount: %p (%d) %s",
@@ -3816,7 +3811,6 @@ void Device::releaseQueue(hsa_queue_t* queue, const std::vector<uint32_t>& cuMas
         auto& qInfo = qIter->second;
         assert(qInfo.refCount > 0);
         qInfo.refCount--;
-        PhiRingBind(qIter->first, -1);  // witness: unbind
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "releaseQueue refCount:%p (%d)",
                 qIter->first->base_address, qIter->second.refCount);
         break;  // Found and processed the queue

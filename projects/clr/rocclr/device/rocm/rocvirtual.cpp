@@ -758,19 +758,11 @@ bool VirtualGPU::HwQueueTracker::Create() {
 // H carries 1/d), so a tick->ns conversion would buy nothing and could only introduce error.
 void VirtualGPU::PhiReport() const {
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-          "T313PHIVG dispatches=%lu d_ticks=%lu d_min=%lu d_min_shared=%lu samples=%lu "
-          "shared=%lu rejected=%lu",
+          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
-          (unsigned long)phi_d_min_ticks_.load(std::memory_order_relaxed),
-          (unsigned long)phi_d_min_shared_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
-          (unsigned long)phi_samples_shared_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed));
-}
-
-uint32_t VirtualGPU::gpu_device_queue_share() const {
-  return dev().PhiRingShare(gpu_queue_);
 }
 
 void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
@@ -801,19 +793,6 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   const uint64_t n = phi_d_samples_.load(std::memory_order_relaxed);
   phi_d_ticks_.store((n == 0) ? dur : (prev * 7 + dur) / 8, std::memory_order_relaxed);
   phi_d_samples_.fetch_add(1, std::memory_order_relaxed);
-  uint64_t cur_min = phi_d_min_ticks_.load(std::memory_order_relaxed);
-  while ((cur_min == 0 || dur < cur_min) &&
-         !phi_d_min_ticks_.compare_exchange_weak(cur_min, dur, std::memory_order_relaxed)) {
-  }
-  // ⭐ Record WHETHER this sample was trustworthy, rather than assuming it. A shared ring
-  // serialises its streams, so the kernel provably ran alone and `dur` is uninflated.
-  if (gpu_device_queue_share() >= 2) {
-    phi_samples_shared_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t cur_s = phi_d_min_shared_.load(std::memory_order_relaxed);
-    while ((cur_s == 0 || dur < cur_s) &&
-           !phi_d_min_shared_.compare_exchange_weak(cur_s, dur, std::memory_order_relaxed)) {
-    }
-  }
 }
 
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_val, Timestamp* ts,
@@ -2624,10 +2603,7 @@ VirtualGPU::~VirtualGPU() {
   if (dev().settings().queue_phi_ != 0) {
     dev().PhiRecordStream(phi_dispatches_.load(std::memory_order_relaxed),
                           phi_d_ticks_.load(std::memory_order_relaxed),
-                          phi_d_min_ticks_.load(std::memory_order_relaxed),
-                          phi_d_min_shared_.load(std::memory_order_relaxed),
                           phi_d_samples_.load(std::memory_order_relaxed),
-                          phi_samples_shared_.load(std::memory_order_relaxed),
                           phi_d_rejected_.load(std::memory_order_relaxed));
   }
 
