@@ -809,18 +809,10 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   // serialises its streams, so the kernel provably ran alone and `dur` is uninflated.
   if (gpu_device_queue_share() >= 2) {
     phi_samples_shared_.fetch_add(1, std::memory_order_relaxed);
-    // ⭐ Only a witnessed sample earns a place in the per-kernel cache.
-    dev().PhiRecordKernelD(sig->phi_kernel_object_, dur);
     uint64_t cur_s = phi_d_min_shared_.load(std::memory_order_relaxed);
     while ((cur_s == 0 || dur < cur_s) &&
            !phi_d_min_shared_.compare_exchange_weak(cur_s, dur, std::memory_order_relaxed)) {
     }
-  }
-}
-
-void VirtualGPU::HwQueueTracker::PhiTagKernel(uint64_t kernel_object) {
-  if (current_id_ < signal_list_.size() && signal_list_[current_id_] != nullptr) {
-    signal_list_[current_id_]->phi_kernel_object_ = kernel_object;
   }
 }
 
@@ -1652,8 +1644,7 @@ void VirtualGPU::CompleteAqlSubmission(const AqlSlotReservation& reservation) {
 // ================================================================================================
 template <typename AqlPacket>
 bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, uint16_t rest,
-                                          bool blocking, bool attach_signal,
-                                          bool is_dispatch){
+                                          bool blocking, bool attach_signal) {
   const uint32_t queueSize = gpu_queue_->size;
   const uint32_t queueMask = queueSize - 1;
   const uint32_t sw_queue_size = queueMask;
@@ -1681,20 +1672,8 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   const bool phi_only_signal = phi_wants_signal && !caller_wants_signal;
   // Get active signal for current dispatch if profiling is necessary
   packet->completion_signal =
-      Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal, is_dispatch,
-                              /*phi_only=*/phi_only_signal);
-  // ⭐ Tag the signal with WHICH kernel it timed, so the recycle-point sample can be pooled per
-  // kernel_object. Read back at the next recycle, exactly like `phi_is_dispatch_`.
-  // ⛔ Guarded on is_dispatch: a PM4 perf-counter packet has no kernel_object, and folding one in
-  // would be the barrier-mixture bug reintroduced one call site over.
-  // ⛔ `if constexpr`: this template also instantiates for hsa_ext_amd_aql_pm4_packet_t, which has
-  // no kernel_object member at all. A runtime guard would still fail to compile.
-  if constexpr (std::is_same_v<AqlPacket, hsa_kernel_dispatch_packet_t> ||
-                std::is_same_v<AqlPacket, hsa_amd_ext_kernel_dispatch_packet_t>) {
-    if (is_dispatch && attachSignal) {
-      Barriers().PhiTagKernel(static_cast<uint64_t>(packet->kernel_object));
-    }
-  }
+      Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal,
+                              /*is_dispatch=*/true, /*phi_only=*/phi_only_signal);
 
   if (timestamp_ != nullptr) {
     // If profiling is enabled, store the correlation ID in the dispatch packet. The profiler
@@ -1768,9 +1747,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // Mark the flag indicating if a dispatch is outstanding.
   // We are not waiting after every dispatch.
   hasPendingDispatch_ = true;
-  if (is_dispatch) {
-    phi_dispatches_.fetch_add(1, std::memory_order_relaxed);  // rho/d == dispatch rate
-  }
+  phi_dispatches_.fetch_add(1, std::memory_order_relaxed);  // rho/d == the dispatch rate
 
   // Wait on signal ?
   if (blocking) {
@@ -2344,9 +2321,7 @@ bool VirtualGPU::dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet,
     case PerfCounter::ROC_GFX9:
     case PerfCounter::ROC_GFX10: {
       uint16_t hdr = HSA_PACKET_TYPE_VENDOR_SPECIFIC << HSA_PACKET_HEADER_TYPE;
-      // ⛔ is_dispatch=false: a PM4 perf-counter packet is not a kernel dispatch. Its duration
-      // is not a service interval and it has no kernel_object.
-      return dispatchGenericAqlPacket(packet, hdr, 0, blocking, false, /*is_dispatch=*/false);
+      return dispatchGenericAqlPacket(packet, hdr, 0, blocking);
     } break;
   }
 

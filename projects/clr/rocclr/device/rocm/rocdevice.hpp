@@ -72,8 +72,6 @@ class ProfilingSignal : public amd::ReferenceCountedObject {
   //! estimator folds in dispatches only: a barrier's start->end is not a service interval, and
   //! mixing the two was MEASURED to inflate `d` by a fixed ~8.6 us while leaving the slope right.
   bool phi_is_dispatch_ = false;
-  //! Which kernel this signal timed, so a recycle-point sample can be pooled per kernel_object.
-  uint64_t phi_kernel_object_ = 0;
   std::recursive_mutex lock_;  //!< Signal lock for update
 
   typedef union {
@@ -859,36 +857,6 @@ class Device : public NullDevice {
   //! `active_queue_access_` there would create a new lock edge on the dispatch path.
   //! Indexed by `id % numHwPipes_` -- at cap <= numHwPipes_ that IS the ring identity, and it is
   //! the same coordinate the selector will use.
-  //! ⭐⭐ PER-KERNEL SOLO-DEMAND CACHE. `d` is a property of the KERNEL, not the stream, and the
-  //! per-stream estimate cannot recover solo demand when a stream never runs alone (MEASURED: four
-  //! spread streams read 484k/1.25M/1.27M/1.22M against a 449k truth). Pooled across streams the
-  //! same kernel needs ONE clean observation from ANY stream at ANY time.
-  //! ⛔ ADMISSION IS GATED ON THE WITNESS: only samples taken while the sampling stream's ring was
-  //! SHARED are folded in, because only those are provably uninflated (MEASURED within 0.2% of
-  //! solo). An unwitnessed sample is discarded rather than averaged in.
-  mutable std::unordered_map<uint64_t, uint64_t> phi_kernel_d_;
-  mutable amd::Monitor phi_kernel_d_lock_;
-
- public:
-  //! Fold a TRUSTWORTHY duration for `kernel_object` into the cache, keeping the minimum.
-  void PhiRecordKernelD(uint64_t kernel_object, uint64_t dur) const {
-    if (kernel_object == 0 || dur == 0) return;
-    amd::ScopedLock l(phi_kernel_d_lock_);
-    auto it = phi_kernel_d_.find(kernel_object);
-    if (it == phi_kernel_d_.end() || dur < it->second) phi_kernel_d_[kernel_object] = dur;
-  }
-  //! Solo demand for `kernel_object`, or 0 if no trustworthy sample has ever been seen.
-  uint64_t PhiKernelD(uint64_t kernel_object) const {
-    amd::ScopedLock l(phi_kernel_d_lock_);
-    auto it = phi_kernel_d_.find(kernel_object);
-    return (it == phi_kernel_d_.end()) ? 0 : it->second;
-  }
-  size_t PhiKernelDCount() const {
-    amd::ScopedLock l(phi_kernel_d_lock_);
-    return phi_kernel_d_.size();
-  }
-
- private:
   static constexpr uint32_t kPhiMaxRings = 8;
   mutable std::atomic<uint32_t> phi_ring_binds_[kPhiMaxRings] = {};
 

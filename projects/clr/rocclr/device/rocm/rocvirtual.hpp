@@ -281,7 +281,6 @@ class VirtualGPU : public device::VirtualDevice {
     bool Create();
 
     //! Finds a free signal for the upcoming operation
-    void PhiTagKernel(uint64_t kernel_object);
     hsa_signal_t ActiveSignal(hsa_signal_value_t init_val = kInitSignalValueOne,
                               Timestamp* ts = nullptr, bool attach_signal = true,
                              bool is_dispatch = false, bool phi_only = false);
@@ -756,8 +755,7 @@ class VirtualGPU : public device::VirtualDevice {
 
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
-                                                              bool attach_signal = false,
-                                                              bool is_dispatch = true);
+                                                              bool attach_signal = false);
 
   bool dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet, const uint32_t gfxVersion,
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
