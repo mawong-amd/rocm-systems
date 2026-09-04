@@ -214,6 +214,16 @@ void Device::checkAtomicSupport() {
 }
 
 Device::~Device() {
+  if (settings().queue_phi_ != 0) {
+    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+            "T313PHI mode=%u cap=%u pipes=%u reached=%lu eligible=%lu declined_regime=%lu "
+            "bypass_preferred=%lu",
+            settings().queue_phi_, settings().max_hw_queues_, numHwPipes_,
+            (unsigned long)phi_stats_.reached.load(std::memory_order_relaxed),
+            (unsigned long)phi_stats_.eligible.load(std::memory_order_relaxed),
+            (unsigned long)phi_stats_.declined_regime.load(std::memory_order_relaxed),
+            (unsigned long)phi_stats_.bypass_preferred.load(std::memory_order_relaxed));
+  }
   // Drain the ROCr async-events thread before releasing any backend state.
   // This guards OCL teardown; for HIP the drain already ran via RuntimeTearDown,
   // so this is a safe no-op in that path.
@@ -3370,6 +3380,20 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
 
   // We've hit the limit, must reuse - find the queue with lowest load metric
   if (qIndex < QueuePriority::Total && queuePool_[qIndex].size() > 0) {
+    phi_stats_.reached.fetch_add(1, std::memory_order_relaxed);
+    // ⭐ THE PLACEMENT-POLICY GATE. Two conditions, counted separately so a zero says which.
+    //  - queue_phi_ is already subordinate to dynamic_queues_ (see Settings::create).
+    //  - The regime condition is the design premise, not a tuning knob: with at most one queue
+    //    per pipe the pipe-collocation cost is identically zero and the ring term is the whole
+    //    model. Above that a pipe holds more than one queue, the omitted term stops being zero,
+    //    and the model is simply not defined -- so it DECLINES rather than extrapolating.
+    const bool phi_live = settings().queue_phi_ != 0;
+    const bool phi_in_regime = settings().max_hw_queues_ <= numHwPipes_;
+    if (phi_live && !phi_in_regime) {
+      phi_stats_.declined_regime.fetch_add(1, std::memory_order_relaxed);
+    } else if (phi_live) {
+      phi_stats_.eligible.fetch_add(1, std::memory_order_relaxed);
+    }
     // Best-effort preferred queue hint: for graph stream stability
     // Skip preferred if it's in the excluded set
     if (preferred != nullptr) {
@@ -3377,6 +3401,11 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
       if (!preferred_excluded) {
         auto it = queuePool_[qIndex].find(preferred);
         if (it != queuePool_[qIndex].end()) {
+          // ⭐ This path returns WITHOUT evaluating any metric. In the steady state -- stream goes
+          // idle, releases, then returns on its `last_hwq_` hint -- it is the DOMINANT path, so a
+          // policy that only replaces the comparator would rarely run at all. Counted so that
+          // "the policy did nothing" and "the policy was never asked" stay distinguishable.
+          phi_stats_.bypass_preferred.fetch_add(1, std::memory_order_relaxed);
           it->second.refCount++;
           ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
                   "Reusing preferred queue: %p refCount: %d",

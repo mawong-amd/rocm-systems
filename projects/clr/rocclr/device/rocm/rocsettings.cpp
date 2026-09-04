@@ -84,6 +84,24 @@ Settings::Settings() {
   max_hw_queues_ = GPU_MAX_HW_QUEUES;
   aql_barrier_opt_ = amd::IS_HIP && DEBUG_CLR_AQL_BARRIER_OPT;
 
+  // Total-slowdown placement. Subordinate to dynamic_queues_: mode 0 there disables the pool
+  // release/reacquire path entirely, so this policy would have no binding events to act on.
+  // ⛔ CLAMPED. The field is 2 bits and the flag is a uint; an unclamped out-of-range value
+  // truncates to 0 and presents as a clean stock baseline, which is worse than an error.
+  {
+    const uint32_t requested = DEBUG_CLR_QUEUE_PHI;
+    const uint32_t clamped = std::min(requested, 2u);
+    if (requested != clamped) {
+      ClPrint(amd::LOG_WARNING, amd::LOG_INIT,
+              "DEBUG_CLR_QUEUE_PHI=%u is out of range; clamped to %u", requested, clamped);
+    }
+    queue_phi_ = (amd::IS_HIP && dynamic_queues_ > 0) ? clamped : 0;
+    if (clamped != 0 && queue_phi_ == 0) {
+      ClPrint(amd::LOG_WARNING, amd::LOG_INIT,
+              "DEBUG_CLR_QUEUE_PHI=%u ignored: requires DEBUG_HIP_DYNAMIC_QUEUES > 0", clamped);
+    }
+  }
+
   queue_pipe_dist_ = false;
 }
 

@@ -68,6 +68,10 @@ class ProfilingSignal : public amd::ReferenceCountedObject {
   HwQueueEngine engine_;  //!< Engine used with this signal
   //! AccumulateCommand dispatch record this signal supplies timing for.
   uint32_t dispatch_slot_ = kNoDispatchSlot;
+  //! ⭐ True when this signal timed a KERNEL DISPATCH rather than a barrier/marker. The `d`
+  //! estimator folds in dispatches only: a barrier's start->end is not a service interval, and
+  //! mixing the two was MEASURED to inflate `d` by a fixed ~8.6 us while leaving the slope right.
+  bool phi_is_dispatch_ = false;
   std::recursive_mutex lock_;  //!< Signal lock for update
 
   typedef union {
@@ -830,6 +834,18 @@ class Device : public NullDevice {
   };
   //! a vector for keeping Pool of HSA queues with low, normal and high priorities for recycling
   std::vector<std::map<hsa_queue_t*, QueueInfo, QueueCompare>> queuePool_;
+
+  //! ⭐ Placement-policy accounting. EVERY path out of the gate is counted separately, including
+  //! the declines, because a policy that silently does not run is indistinguishable from one that
+  //! runs and does nothing -- and that ambiguity has cost this work more than any wrong constant.
+  //! Printed at device teardown whenever queue_phi_ != 0.
+  struct PhiStats {
+    std::atomic<uint64_t> reached{0};        //!< getQueueFromPool consulted the selector at all
+    std::atomic<uint64_t> eligible{0};       //!< ... and the policy was live and in-regime
+    std::atomic<uint64_t> declined_regime{0};//!< ... declined: max_hw_queues_ > numHwPipes_
+    std::atomic<uint64_t> bypass_preferred{0};//!< returned via the `preferred` hint, selector unused
+  };
+  mutable PhiStats phi_stats_;
   amd::Monitor active_queue_access_;            //!< Lock to serialise virtual gpu list access
   std::atomic<uint32_t> num_queues_[QueuePriority::Total] = {};  //!< Per-priority queue counters
 

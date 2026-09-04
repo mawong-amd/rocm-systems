@@ -39,7 +39,14 @@ class Settings : public device::Settings {
       uint queue_pipe_dist_ : 1;       //!< gfx94x queue pipe distribution
       uint ext_dispatch_packet_ : 1;   //!< Uses new ext dispatch packet for all launches
       uint aql_barrier_opt_ : 1;       //!< Per-stream barrier-bit optimization
-      uint reserved_ : 17;
+      //! Total-slowdown placement policy: 0 off, 1 observe only, 2 select.
+      //! ⛔ 2 BITS, and DEBUG_CLR_QUEUE_PHI is a uint -- it MUST be clamped where it is
+      //! assigned. dynamic_queues_ has the same width and is NOT clamped, so
+      //! DEBUG_HIP_DYNAMIC_QUEUES=4 silently reads as 0 (off) with no diagnostic. Do not
+      //! reproduce that here: a mode that silently degrades to a stock baseline is
+      //! indistinguishable from a working control.
+      uint queue_phi_ : 2;
+      uint reserved_ : 15;
     };
     uint value_;
   };

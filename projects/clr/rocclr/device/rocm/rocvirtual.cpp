@@ -753,8 +753,33 @@ bool VirtualGPU::HwQueueTracker::Create() {
 }
 
 // ================================================================================================
+// ⭐ Fold one completed packet's duration into this stream's `d` estimate.
+// Units are RAW AGENT TICKS and are never translated: Phi is dimensionless (T carries units of d,
+// H carries 1/d), so a tick->ns conversion would buy nothing and could only introduce error.
+void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
+  if (sig == nullptr) return;
+  sig->CacheTimingData(gpu_device());
+  uint64_t start = 0, end = 0;
+  sig->GetCachedTiming(start, end);
+  // ⛔ Reject rather than clamp. The runtime already warns that the CP can leave start/end zero or
+  // inverted; folding a bad reading into an EWMA corrupts every later sample, and a silently
+  // clamped zero is indistinguishable from a real short kernel.
+  if (start == 0 || end == 0 || end <= start) {
+    ++phi_d_rejected_;
+    return;
+  }
+  const uint64_t dur = end - start;
+  // EWMA, 1/8 weight, integer. Seeded by the first sample so it does not crawl up from zero.
+  // ⛔ Written WITHOUT a subtraction on purpose. The natural form
+  //   `phi_d_ticks_ + (dur - phi_d_ticks_) / 8`
+  // UNDERFLOWS whenever dur < phi_d_ticks_ -- these are uint64_t -- and pins the estimate near
+  // UINT64_MAX. That was measured, not imagined: the first build read d_ticks = 1.8e19.
+  phi_d_ticks_ = (phi_d_samples_ == 0) ? dur : (phi_d_ticks_ * 7 + dur) / 8;
+  ++phi_d_samples_;
+}
+
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_val, Timestamp* ts,
-                                                      bool attach_signal) {
+                                                      bool attach_signal, bool is_dispatch) {
   amd::Command* cmd = gpu_.command();
   // If no signal is needed, decrement the refcount and clear the hw_event of current command
   if (!attach_signal) {
@@ -791,6 +816,22 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
     ++current_id_ %= signal_list_.size();
     // Make sure the previous operation on the current signal is done
     WaitCurrent();
+
+    // ⭐ THE `d` SAMPLE. WaitCurrent() has just PROVEN signal_list_[current_id_] complete, and it
+    // is about to be recycled -- but ResetCachedTiming() is still ~60 lines below, so its
+    // timestamps are intact. Harvesting here adds no wait and no HSA round trip beyond the one
+    // CacheTimingData already makes (it early-returns when the timing is cached).
+    // ⭐⭐ It fires once per trip around signal_list_, i.e. once per pool cycle, which is
+    // PHASE-UNIFORM through a burst. That is the whole point: the pre-existing read path runs from
+    // CpuWaitForSignal <- releaseGpuMemoryFence and is therefore tail-of-burst BY CONSTRUCTION.
+    // ⚠️ It does not fire when `new_signal` is true (pool growing because the GPU is behind), so
+    // the sample is biased toward the steady state. Acceptable -- steady state is what Phi prices
+    // -- but it is a bias, not an absence of one, and it must be said out loud.
+    // ⭐ The slot still describes its PREVIOUS use here -- it is reconfigured further down -- so
+    // `phi_is_dispatch_` correctly identifies what the completed packet was.
+    if (gpu_.dev().settings().queue_phi_ != 0 && signal_list_[current_id_]->phi_is_dispatch_) {
+      gpu_.PhiSampleDuration(signal_list_[current_id_]);
+    }
 
     // Have to wait the next signal in the queue to avoid a race condition between
     // a GPU waiter(which may be not triggered yet) and CPU signal reset below
@@ -847,6 +888,7 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
   // Reset the signal and return
   Hsa::signal_silent_store_relaxed(prof_signal->signal_, init_val);
   prof_signal->flags_.done_ = false;
+  prof_signal->phi_is_dispatch_ = is_dispatch;  // describes THIS use, read back at the next recycle
   prof_signal->engine_ = engine_;
   prof_signal->ReleaseOrderingEdge();
   prof_signal->ResetCachedTiming();
@@ -1562,10 +1604,18 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   RecordAqlPacketHeader(reservation, 0, header);
   CompleteAqlSubmission(reservation);
 
-  bool attachSignal = timestamp_ != nullptr || attach_signal;
+  // ⛔ The estimator can only see packets that CARRY a completion signal, and measurement on
+  // ROCm 10.1 says ordinary dispatches carry none (90 launches -> 2 signals, both from
+  // hipStreamSynchronize). So while the policy is live, force one. FULL FIDELITY on purpose:
+  // sparse forcing was measured to degrade the policy, so sampling density is a shipping
+  // optimisation to be fitted against a quality curve, not a design-time guess.
+  const bool phi_wants_signal = dev().settings().queue_phi_ != 0 &&
+                                dev().settings().max_hw_queues_ <= dev().NumHwPipes();
+  bool attachSignal = timestamp_ != nullptr || attach_signal || phi_wants_signal;
   // Get active signal for current dispatch if profiling is necessary
   packet->completion_signal =
-      Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+      Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal,
+                              /*is_dispatch=*/true);
 
   if (timestamp_ != nullptr) {
     // If profiling is enabled, store the correlation ID in the dispatch packet. The profiler
@@ -1630,6 +1680,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // Mark the flag indicating if a dispatch is outstanding.
   // We are not waiting after every dispatch.
   hasPendingDispatch_ = true;
+  ++phi_dispatches_;  // rho/d == dispatch rate: the free half of Phi
 
   // Wait on signal ?
   if (blocking) {
@@ -2478,6 +2529,15 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
 
 // ================================================================================================
 VirtualGPU::~VirtualGPU() {
+  // ⭐ Per-stream estimator readout. Printed for every stream so a starved or never-sampled one is
+  // visible, not averaged away. `d` is in AGENT TICKS by design (Phi is dimensionless).
+  if (dev().settings().queue_phi_ != 0) {
+    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+            "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
+            (unsigned long)phi_dispatches_, (unsigned long)phi_d_ticks_,
+            (unsigned long)phi_d_samples_, (unsigned long)phi_d_rejected_);
+  }
+
   // Release SDMA engine assignment for this VirtualGPU
   ReleaseSdmaEngines();
 

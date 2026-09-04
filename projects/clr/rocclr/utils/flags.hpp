@@ -141,6 +141,15 @@ release(uint, GPU_MAX_HW_QUEUES, 4,                                           \
          "The maximum number of HW queues allocated per device")              \
 release(bool, DEBUG_CLR_AQL_BARRIER_OPT, true,                                \
         "Enable per-stream AQL barrier-bit optimization on shared HW queues") \
+release(uint, DEBUG_CLR_QUEUE_PHI, 0,                                         \
+        "Place streams on HW queues by a total-slowdown potential instead of "\
+        "the depth heuristic. 0 = off (upstream GetLoadMetric), 1 = observe "  \
+        "only (count what the policy WOULD do, change nothing), 2 = select. "  \
+        "Subordinate to DEBUG_HIP_DYNAMIC_QUEUES > 0, which owns the pool and "\
+        "the release path this policy needs. Only defined while "              \
+        "GPU_MAX_HW_QUEUES <= the hardware pipe count, because above that a "  \
+        "pipe holds more than one queue and the collocation term this model "  \
+        "omits stops being zero; there the policy declines and says so.")      \
 release(bool, GPU_IMAGE_BUFFER_WAR, true,                                     \
         "Enables image buffer workaround")                                    \
 release(cstring, HIP_VISIBLE_DEVICES, "",                                     \

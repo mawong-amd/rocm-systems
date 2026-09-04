@@ -282,7 +282,8 @@ class VirtualGPU : public device::VirtualDevice {
 
     //! Finds a free signal for the upcoming operation
     hsa_signal_t ActiveSignal(hsa_signal_value_t init_val = kInitSignalValueOne,
-                              Timestamp* ts = nullptr, bool attach_signal = true);
+                              Timestamp* ts = nullptr, bool attach_signal = true,
+                             bool is_dispatch = false);
 
     //! Wait for the curent active signal. Can idle the queue
     bool WaitCurrent();
@@ -897,6 +898,21 @@ class VirtualGPU : public device::VirtualDevice {
     };
     uint32_t state_;
   };
+
+  //! ⭐ PLACEMENT-POLICY STATE. Phi = sum_rings T_q*H_q with T_q = sum rho*d and H_q = sum rho/d is
+  //! DIMENSIONLESS -- T carries units of d, H carries 1/d -- so `d` is kept in RAW AGENT TICKS and
+  //! never translated. Deliberate: every tick<->ns conversion is somewhere to put a units bug and
+  //! the model does not need one.
+  //! ⭐ rho/d is EXACTLY the dispatch rate (rho = c*d/W, so rho/d = c/W), which means H_q needs
+  //! only `phi_dispatches_` -- a counter, no timestamps, no sampling, no bias. Only T_q needs `d`.
+  //! const + mutable: the tracker holds `gpu_` by const reference, and this is
+  //! accounting/estimator state rather than observable queue state.
+  void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
+
+  mutable uint64_t phi_dispatches_ = 0;  //!< monotonic dispatch count for this stream
+  mutable uint64_t phi_d_ticks_ = 0;     //!< EWMA of completed-packet duration, agent ticks
+  mutable uint64_t phi_d_samples_ = 0;   //!< samples folded in
+  mutable uint64_t phi_d_rejected_ = 0;  //!< completed packets whose timing was unusable
 
   Timestamp* timestamp_;
   bool sdma_profiling_for_cmd_ = false;  //!< SDMA profiling enabled for current command
