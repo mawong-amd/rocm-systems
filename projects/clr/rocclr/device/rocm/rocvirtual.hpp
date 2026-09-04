@@ -1041,6 +1041,22 @@ class VirtualGPU : public device::VirtualDevice {
   };
   mutable PhiShapeSlot phi_shapes_[kPhiShapes];
   mutable std::atomic<uint64_t> phi_shape_overflow_{0};  //!< shapes that found no slot
+ public:
+  //! ⭐ Shapes seen, and how many of them have NEVER completed a block of `L` samples. ⛔ Without
+  //! this, "`d` is unknown" and "the sampler never fired" are indistinguishable in a readout, and
+  //! they call for opposite actions. `shape_open > 0` at teardown means those shapes were replayed
+  //! fewer than `L` times each, which is the regime where the block-mean has nothing to say.
+  void PhiShapeCensus(uint64_t& live, uint64_t& open) const {
+    live = 0;
+    open = 0;
+    for (size_t i = 0; i < kPhiShapes; ++i) {
+      if (phi_shapes_[i].key.load(std::memory_order_relaxed) == 0) continue;
+      ++live;
+      if (phi_shapes_[i].folds == 0) ++open;
+    }
+  }
+
+ private:
   mutable std::atomic<uint64_t> phi_batch_rot_fallback_{0};  //!< cursor for overflowed shapes
 
   //! Slot for `eligible`: the existing one, else a free one, else **nullptr**.

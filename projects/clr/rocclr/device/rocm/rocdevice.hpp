@@ -745,6 +745,13 @@ class Device : public NullDevice {
   //! exists -- and it is also where the cross-thread read of another stream's counters gets shaken
   //! out, because here a torn read costs a wrong LOG LINE rather than a wrong placement.
   bool PhiShadow() const { return PhiActive() && settings().queue_phi_ >= 2; }
+  //! ⭐ PHI=3: additionally TIME the shadow body. ⛔ The cost of this instrument is a first-class
+  //! quantity -- it runs inside `active_queue_access_`, which serialises every queue acquire and
+  //! release device-wide, and in the target workload decisions are ~15x more frequent than in any
+  //! toy we have. Today there is no way to answer "what did the shadow cost" from a production log
+  //! at all. It is its OWN mode because the timestamp read is ~58-110 ns against a body of ~200-300
+  //! ns, i.e. it would be a ~30% observer effect if it were always on.
+  bool PhiTimed() const { return PhiActive() && settings().queue_phi_ >= 3; }
 
   //! Returns true if PM4 emulation is enabled
   bool IsPm4Emulation() const { return pm4_emulation_; }
@@ -957,6 +964,28 @@ class Device : public NullDevice {
     // Payload before key: a reader seeing a live `queue_id` sees payload at least as new.
     s.queue_id.store(queue_id, std::memory_order_release);
   }
+  //! ⛔⛔ `disp_now` MUST MOVE WITH `phi_dispatches_`, NOT WITH THE SAMPLER. Published only from
+  //! PhiSampleDuration, the numerator of the reader's rate is as-of the last COMPLETED sample while
+  //! the denominator `t_ref - base_start` is as-of NOW, so a busy stream whose samples are rare
+  //! reads a rate too LOW by exactly the sampling lag. A low rate lowers rho, lowers `H_q`, and
+  //! makes the ring look MORE attractive: the MERGE direction -- the same direction the seqlock was
+  //! added to close, at a far larger magnitude (one sample period, not two instructions).
+  //! ⛔ It bites hardest in the workload this is aimed at: a graph batch tags ONE Phi-only signal,
+  //! and the block-mean holds even that back until a whole rotation of `L` completes.
+  //! ⭐ Deliberately OUTSIDE the seqlock. `disp_now` is monotone and independent of the base pair;
+  //! a reader pairing a NEW `disp_now` with an OLD base over-counts the numerator, i.e. reads the
+  //! rate too HIGH, which over-prices and therefore SPREADS -- the safe direction. The pair that
+  //! must not tear is (base_start, base_disp), and that is exactly what `seq` covers.
+  void PhiPublishDisp(uint32_t idx, uint64_t disp_now) const {
+    if (idx >= kPhiMaxStreams) return;
+    phi_slots_[idx].disp_now.store(disp_now, std::memory_order_relaxed);
+  }
+  //! Streams that found no slot, i.e. are invisible to the shadow census. ⛔ Must be REPORTED: an
+  //! invisible stream lowers a ring's `n` and can make an occupied ring read as free, which
+  //! corrupts the all-occupied fraction -- the single number this design hinges on -- silently.
+  uint64_t PhiSlotOverflow() const {
+    return phi_slot_overflow_.load(std::memory_order_relaxed);
+  }
 
  private:
   mutable std::atomic<uint64_t> phi_sel_seq_{0};  //!< decision key for T313SEL / T313SELQ
@@ -975,9 +1004,16 @@ class Device : public NullDevice {
     uint32_t cands, n_free, n_meas, mult_w, mult_u;
     int8_t eval_w, eval_u, agree_w, agree_u, wu_same, via_bypass;
   };
+  //! ⭐ `rc`/`ded` are stock's OWN view of the same candidate at the same instant (read before the
+  //! refCount increment). They are here so the shadow census can be validated IN BAND: `n` is what
+  //! the slot array can see, `rc` is ground truth for "is this ring occupied", and `n != rc` is a
+  //! census miss that would otherwise be invisible. `ded` is stock's 2048-penalty term, which Phi
+  //! has no analogue for -- without it a disagreement caused by that term is indistinguishable from
+  //! one caused by the ranking.
   struct PhiSelQRec {
     uint64_t seq, q;
-    uint32_t n, n_unk;
+    uint32_t n, n_unk, rc;
+    uint8_t ded;
     float Tw, Hw, Tu, Hu;
   };
   static constexpr size_t kPhiTraceSel = 1u << 16;   //!< 64 Ki decisions   (~2.6 MB)
@@ -986,6 +1022,8 @@ class Device : public NullDevice {
   mutable std::vector<PhiSelQRec> phi_trace_selq_;
   mutable std::atomic<uint64_t> phi_trace_sel_n_{0};
   mutable std::atomic<uint64_t> phi_trace_selq_n_{0};
+  mutable std::atomic<uint64_t> phi_body_ticks_{0};  //!< PHI=3 only: summed shadow-body duration
+  mutable std::atomic<uint64_t> phi_body_max_{0};    //!< PHI=3 only: worst single body
 
  public:
   //! Format and emit the whole trace. Called once, at device teardown.
@@ -998,17 +1036,19 @@ class Device : public NullDevice {
   //! misses ALL of them, because `vgpus_` is already empty by then (verified: the device line
   //! prints, the per-stream lines do not). The union of the two covers both.
   struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, samples, rejected, skipped, win,
-                             rate_disp, rate_ticks, sweep_max, shape_ovf; };
+                             rate_disp, rate_ticks, sweep_max, shape_ovf, shape_live,
+                             shape_open; };
   mutable std::vector<PhiStreamSnapshot> phi_streams_;
   mutable amd::Monitor phi_streams_lock_;
 
  public:
   void PhiRecordStream(uint64_t dispatches, uint64_t d_ticks, uint64_t samples, uint64_t rejected,
                        uint64_t skipped, uint64_t win, uint64_t rate_disp, uint64_t rate_ticks,
-                       uint64_t sweep_max, uint64_t shape_ovf) const {
+                       uint64_t sweep_max, uint64_t shape_ovf, uint64_t shape_live,
+                       uint64_t shape_open) const {
     amd::ScopedLock l(phi_streams_lock_);
     phi_streams_.push_back({dispatches, d_ticks, samples, rejected, skipped, win, rate_disp,
-                            rate_ticks, sweep_max, shape_ovf});
+                            rate_ticks, sweep_max, shape_ovf, shape_live, shape_open});
   }
 
  private:

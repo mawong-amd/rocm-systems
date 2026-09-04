@@ -227,22 +227,28 @@ Device::~Device() {
       for (const auto& v : phi_streams_) {
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
                 "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
-                "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu",
+                "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu "
+                "shape_live=%lu shape_open=%lu",
                 (unsigned long)v.dispatches, (unsigned long)v.d_ticks,
                 (unsigned long)v.samples, (unsigned long)v.rejected,
                 (unsigned long)v.skipped, (unsigned long)v.win, (unsigned long)v.rate_disp,
                 (unsigned long)v.rate_ticks, (unsigned long)v.sweep_max,
-                (unsigned long)v.shape_ovf);
+                (unsigned long)v.shape_ovf, (unsigned long)v.shape_live,
+                (unsigned long)v.shape_open);
       }
     }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "T313PHI mode=%u cap=%u pipes=%u reached=%lu eligible=%lu declined_regime=%lu "
-            "bypass_preferred=%lu",
+            "bypass_preferred=%lu slot_ovf=%lu",
             settings().queue_phi_, settings().max_hw_queues_, numHwPipes_,
             (unsigned long)phi_stats_.reached.load(std::memory_order_relaxed),
             (unsigned long)phi_stats_.eligible.load(std::memory_order_relaxed),
             (unsigned long)phi_stats_.declined_regime.load(std::memory_order_relaxed),
-            (unsigned long)phi_stats_.bypass_preferred.load(std::memory_order_relaxed));
+            (unsigned long)phi_stats_.bypass_preferred.load(std::memory_order_relaxed),
+            // ⛔ Was computed and never printed. A stream that finds no slot is INVISIBLE to the
+            // census: it lowers `n` and can make an occupied ring read free. Unreported, that is a
+            // silent corruption of the all-occupied fraction.
+            (unsigned long)PhiSlotOverflow());
   }
   // Drain the ROCr async-events thread before releasing any backend state.
   // This guards OCL teardown; for HIP the drain already ran via RuntimeTearDown,
@@ -710,6 +716,20 @@ bool Device::create() {
     LogPrintfError("Unable to create settings for HSA device %s (PCI ID %x)", agent_name,
                    pciDeviceId_);
     return false;
+  }
+
+  // ⛔ ALLOCATE THE SHADOW TRACE HERE, NOT LAZILY ON THE DECISION PATH. The lazy `resize()` ran on
+  // the FIRST decision while `active_queue_access_` was held -- 13 MB of allocate-and-zero on the
+  // lock that serialises every queue acquire and release device-wide. MEASURED with PHI=3:
+  // `body_max` = 3.44 / 3.63 / 2.69 ms at 8 / 64 / 256 streams, against a steady-state body of
+  // 259 / 282 / 463 ns, i.e. the first decision cost ~10,000x the others and dominated the MEAN.
+  // ⭐ It also removes a standing hazard: the lazy resize was safe only because both call sites
+  // happen to hold `active_queue_access_`, an invariant nothing checks and a third call site would
+  // silently break -- and breaking it reallocates a vector under concurrent writers, which is the
+  // same use-after-free class the slot array was introduced to fix.
+  if (PhiShadow()) {
+    phi_trace_sel_.resize(kPhiTraceSel);
+    phi_trace_selq_.resize(kPhiTraceSelQ);
   }
 
   if (!ValidateComgr()) {
@@ -3402,9 +3422,14 @@ void Device::PhiTraceDump() const {
   // with nothing to show for it.
   const uint64_t sdrop = (sn > kPhiTraceSel) ? (sn - kPhiTraceSel) : 0;
   const uint64_t qdrop = (qn > kPhiTraceSelQ) ? (qn - kPhiTraceSelQ) : 0;
+  const uint64_t bt = phi_body_ticks_.load(std::memory_order_relaxed);
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-          "T313SELSUM decisions=%lu candidates=%lu dropped_sel=%lu dropped_selq=%lu",
-          (unsigned long)sn, (unsigned long)qn, (unsigned long)sdrop, (unsigned long)qdrop);
+          "T313SELSUM decisions=%lu candidates=%lu dropped_sel=%lu dropped_selq=%lu "
+          "body_ticks=%lu body_mean=%lu body_max=%lu slot_hi=%u slot_ovf=%lu",
+          (unsigned long)sn, (unsigned long)qn, (unsigned long)sdrop, (unsigned long)qdrop,
+          (unsigned long)bt, (unsigned long)(bt / (sn ? sn : 1)),
+          (unsigned long)phi_body_max_.load(std::memory_order_relaxed),
+          phi_slot_hi_.load(std::memory_order_relaxed), (unsigned long)PhiSlotOverflow());
   for (uint64_t i = sdrop; i < sn; ++i) {
     const PhiSelRec& r = phi_trace_sel_[i % kPhiTraceSel];
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
@@ -3418,9 +3443,9 @@ void Device::PhiTraceDump() const {
   for (uint64_t i = qdrop; i < qn; ++i) {
     const PhiSelQRec& q = phi_trace_selq_[i % kPhiTraceSelQ];
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-            "T313SELQ seq=%lu q=%lu n=%u nunk=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
-            (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, (double)q.Tw, (double)q.Hw,
-            (double)q.Tu, (double)q.Hu);
+            "T313SELQ seq=%lu q=%lu n=%u nunk=%u rc=%u ded=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
+            (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, q.rc, (unsigned)q.ded,
+            (double)q.Tw, (double)q.Hw, (double)q.Tu, (double)q.Hu);
   }
 }
 
@@ -3450,6 +3475,20 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   // ⭐ Slots publish the rate BASE, not a finished rate, precisely so this edge is applied here and
   // is shared by every stream in the decision.
   const uint64_t t_ref = VirtualGPU::PhiNowTicks();
+  // PHI=3 only. Measures from just after the entry timestamp to the return, i.e. everything this
+  // function does while holding `active_queue_access_`. Called at BOTH return points on purpose:
+  // the `cands.empty()` path is a decision too and omitting it would bias the mean low.
+  const bool timed = PhiTimed();
+  auto note_cost = [this, t_ref, timed]() {
+    if (!timed) return;
+    const uint64_t e = VirtualGPU::PhiNowTicks();
+    if (e <= t_ref) return;
+    const uint64_t dtk = e - t_ref;
+    phi_body_ticks_.fetch_add(dtk, std::memory_order_relaxed);
+    uint64_t m = phi_body_max_.load(std::memory_order_relaxed);
+    while (dtk > m && !phi_body_max_.compare_exchange_weak(m, dtk, std::memory_order_relaxed)) {
+    }
+  };
   // ⛔⛔ EVERY LINE CARRIES ITS OWN DECISION KEY. The per-candidate lines are emitted AFTER their
   // summary, and a scorer that attaches them by parser state gets it wrong the moment anything
   // interleaves -- that exact bug (`T313WITQ`) made a POWERED run look unpowered and cost real
@@ -3458,7 +3497,9 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
 
   struct Cand {
     const hsa_queue_t* q;
-    uint32_t n;      //!< streams bound
+    uint32_t rc;     //!< stock's refCount at THIS instant (read before the increment)
+    uint8_t ded;     //!< stock's hasDedicatedQueue_ (its 2048 metric penalty; Phi has no analogue)
+    uint32_t n;      //!< streams the shadow census can see bound here
     uint32_t n_unk;  //!< ... of which contributed nothing measurable
     double Tw, Hw;   //!< duty-weighted aggregates
     double Tu, Hu;   //!< rho == 1
@@ -3471,26 +3512,56 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     if (excluded_ids != nullptr && excluded_ids->count(q->id) > 0) {
       continue;  // stock would not pick it either; keep the comparison like-for-like
     }
-    Cand c{q, 0, 0, 0.0, 0.0, 0.0, 0.0};
+    cands.push_back(Cand{q, static_cast<uint32_t>(entry.second.refCount),
+                         static_cast<uint8_t>(entry.second.hasDedicatedQueue_ ? 1 : 0),
+                         0, 0, 0.0, 0.0, 0.0, 0.0});
+  }
+  if (!cands.empty()) {
     // ⛔ Read the device's fixed slot array, NEVER `vgpus()` -- that vector is resized/erased under
     // a different monitor than the one held here. See Device::PhiPublishStream.
+    // ⛔ ONE pass over the slots, not one per candidate. The per-candidate form did
+    // `cands x slot_hi` ACQUIRE loads (1,024 at 4 candidates and a 256-stream high-water mark) for
+    // an answer that needs `slot_hi` of them, and `phi_slot_hi_` is a monotone peak, so a process
+    // that ever ran wide pays that forever. This is `slot_hi` acquire loads plus a <=4-entry
+    // linear match, i.e. the same aggregate at 1/cands the atomic traffic.
     const size_t slot_hi = phi_slot_hi_.load(std::memory_order_relaxed);
     for (size_t si = 0; si < slot_hi; ++si) {
       const PhiStreamSlot& sl = phi_slots_[si];
-      if (sl.queue_id.load(std::memory_order_acquire) != q->id) {
-        continue;
+      const uint64_t qid = sl.queue_id.load(std::memory_order_acquire);
+      if (qid == 0) {
+        continue;  // slot free, or the stream is currently unbound
       }
+      Cand* cp = nullptr;
+      for (auto& cc : cands) {
+        if (cc.q->id == qid) {
+          cp = &cc;
+          break;
+        }
+      }
+      if (cp == nullptr) {
+        continue;  // bound to a queue that is not a candidate here (excluded, other priority,
+                   // or a cu-masked/cooperative queue, which never enters queuePool_ at all)
+      }
+      Cand& c = *cp;
       ++c.n;
       uint64_t d = 0, bs = 0, bd = 0, dn = 0;
       // Seqlock read of the (start, disp) pair; see the note on PhiStreamSlot::seq.
-      for (int attempt = 0; attempt < 4; ++attempt) {
+      // ⛔ THE RETRY MUST HAVE AN OUTCOME. Falling out of a bounded retry loop and using whatever
+      // was last read is a torn read with extra steps -- the loop then buys nothing. On failure we
+      // report the rate UNKNOWN, which leaves rho == 1: an OVER-price, i.e. spread, the safe
+      // direction. (Never `n_unk`: that contributes 0 to H_q and would under-price the ring.)
+      bool seq_ok = false;
+      for (int attempt = 0; attempt < 4 && !seq_ok; ++attempt) {
         const uint64_t g0 = sl.seq.load(std::memory_order_acquire);
         if (g0 & 1ull) continue;
         d = sl.d_ticks.load(std::memory_order_relaxed);
         bs = sl.base_start.load(std::memory_order_relaxed);
         bd = sl.base_disp.load(std::memory_order_relaxed);
         dn = sl.disp_now.load(std::memory_order_relaxed);
-        if (sl.seq.load(std::memory_order_acquire) == g0) break;
+        seq_ok = (sl.seq.load(std::memory_order_acquire) == g0);
+      }
+      if (!seq_ok) {
+        bs = 0;  // rate UNKNOWN; `d` is left as read -- it is a single word and cannot tear
       }
       // ⭐ Divide against OUR `t_ref`, shared by every stream in this decision. That is what makes
       // an idle stream's rate DECAY rather than freeze at whatever it last published.
@@ -3524,7 +3595,6 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
       c.Tu += dd_f;
       c.Hu += 1.0 / dd_f;
     }
-    cands.push_back(c);
   }
   if (cands.empty()) {
     // ⛔ CENSUS HOLE otherwise. Stock still returned a queue here (its comparator prefers
@@ -3532,8 +3602,8 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     // #T313SEL != #decisions with nothing to indicate it. Rare, but an undercount that looks like a
     // complete census is exactly the failure mode this trace exists to avoid.
     if (phi_trace_sel_.empty()) {
-      phi_trace_sel_.resize(kPhiTraceSel);
-      phi_trace_selq_.resize(kPhiTraceSelQ);
+      note_cost();
+      return;  // trace not allocated (see Device::create); never resize on the decision path
     }
     PhiSelRec& e = phi_trace_sel_[phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed) %
                                  kPhiTraceSel];
@@ -3543,6 +3613,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     e.eval_w = e.eval_u = 0;
     e.agree_w = e.agree_u = e.wu_same = -1;
     e.via_bypass = via_bypass ? 1 : 0;
+    note_cost();
     return;
   }
 
@@ -3558,53 +3629,79 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   // is `dynamic_queues_ >= 1`, i.e. TRUE by default here, and on equal metric stock prefers the
   // lower `id % numHwPipes_` -- NOT the lower id. Ordering by id instead would diverge from stock on
   // every metric tie and the divergence would be reported as Phi disagreeing.
+  //
+  // ⛔⛔ THE ORDER IS IN TWO PARTS AND THEY MUST NOT BE CONFUSED. `MetricKey` is the part that
+  // carries INFORMATION; everything after it exists only to name a winner. Deriving `eval_*` or
+  // `mult_*` from the full order makes both of them constants -- the tie-breaks include `q->id`,
+  // which is unique, so the full order is TOTAL and no two candidates ever compare equal. MEASURED
+  // on the shipped binary: `eval_w = eval_u = 1` and `mult_w = mult_u = 1` in 331/331 decisions,
+  // including 40 with four FREE rings and 9 with four occupied-but-unmeasurable rings, i.e. exactly
+  // the cases the "no opinion" outcome exists to report. Both checks had become checks that cannot
+  // fail, which is the shape this campaign keeps being bitten by. They are computed from
+  // `MetricKey` alone below.
   const uint32_t pipes = numHwPipes_;
-  auto better = [pipes](const Cand& a, const Cand& b, bool weighted) {
-    const bool a_occ = a.n != 0, b_occ = b.n != 0;
-    if (a_occ != b_occ) return !a_occ;                       // free wins outright
-    const double ha = weighted ? a.Hw : a.Hu;
-    const double hb = weighted ? b.Hw : b.Hu;
-    if (ha != hb) return ha < hb;
+  //! The information-bearing part of the ranking.
+  //!  * `occ` -- from stock's OWN `refCount`, not from the shadow census. `n == 0` means "no stream
+  //!    published a binding here", which is a statement about the census, not about the ring; a
+  //!    slot-overflowed, transiently-unbound or not-yet-published stream then makes an occupied
+  //!    ring read FREE, and free wins outright. `rc` is the same quantity stock's own "unshared"
+  //!    tier uses, so this also stops the free branch manufacturing disagreements.
+  //!  * `blind` -- occupied, and NOTHING on it was measurable. Its `H` is 0, numerically identical
+  //!    to a free ring's, and it therefore WINS among occupied rings on the strength of our not
+  //!    having measured it: the `d == 0` => FREE trap, one level up at ring granularity. Ranked
+  //!    strictly worst instead. MEASURED: Phi's argmin landed on such a ring 9/9 times in the
+  //!    stagger cell.
+  struct MetricKey { int occ, blind; double H; };
+  auto key = [](const Cand& c, bool weighted) {
+    const int occ = (c.rc != 0) ? 1 : 0;
+    return MetricKey{occ, (occ != 0 && c.n == c.n_unk) ? 1 : 0, weighted ? c.Hw : c.Hu};
+  };
+  auto better = [pipes, &key](const Cand& a, const Cand& b, bool weighted) {
+    const MetricKey ka = key(a, weighted), kb = key(b, weighted);
+    if (ka.occ != kb.occ) return ka.occ < kb.occ;            // free wins outright
+    if (ka.blind != kb.blind) return ka.blind < kb.blind;    // "unmeasured" is not "empty"
+    if (ka.H != kb.H) return ka.H < kb.H;
+    // --- below here: TIE-BREAKS ONLY. They name a winner and carry no information. ---
     if (a.n_unk != b.n_unk) return a.n_unk < b.n_unk;        // prefer the ring we know most about
     const uint64_t pa = a.q->id % pipes, pb = b.q->id % pipes;
     if (pa != pb) return pa < pb;                            // stock's pipe_dist tie-break
     return a.q->id < b.q->id;
   };
-  size_t best_w = 0, best_u = 0, worst_w = 0, worst_u = 0;
+  auto tied = [&key](const Cand& a, const Cand& b, bool weighted) {
+    const MetricKey ka = key(a, weighted), kb = key(b, weighted);
+    return ka.occ == kb.occ && ka.blind == kb.blind && ka.H == kb.H;
+  };
+  size_t best_w = 0, best_u = 0;
   uint32_t n_free = 0, n_meas = 0;
   for (size_t i = 0; i < cands.size(); ++i) {
     if (better(cands[i], cands[best_w], true)) best_w = i;
     if (better(cands[i], cands[best_u], false)) best_u = i;
-    if (better(cands[worst_w], cands[i], true)) worst_w = i;
-    if (better(cands[worst_u], cands[i], false)) worst_u = i;
-    if (cands[i].n == 0) ++n_free;
+    if (cands[i].rc == 0) ++n_free;
     if (cands[i].n > cands[i].n_unk) ++n_meas;
   }
   // ⛔⛔ "PHI HAS NO OPINION" IS A DISTINCT OUTCOME AND MUST BE REPORTED AS ONE. When every
   // candidate ties -- all rings free, or every bound stream still unmeasurable -- argmin returns
   // index 0 and the ring it names is an artefact of iteration order, not a decision. Scoring those
   // as disagreements would have reported "Phi disagrees with stock 100% of the time" on a uniform
-  // 6-stream run purely from tie-breaking, which is precisely the check-that-cannot-fail shape this
-  // campaign keeps being bitten by. `eval=0` => `phi_*` and `agree_*` carry NO information; a
-  // scorer must drop those rows, not count them.
-  // Evaluable iff some candidate is strictly worse than the best under the SAME order used to
-  // choose, so a tie at the argmin can no longer masquerade as a decision.
-  const bool eval_w = better(cands[best_w], cands[worst_w], true);
-  const bool eval_u = better(cands[best_u], cands[worst_u], false);
-  // ⛔ ...but that still does not detect a tie AT the argmin: three candidates tied at the minimum
-  // and one higher gives eval=1 with a winner picked by order. Report the MULTIPLICITY so a scorer
-  // can drop or weight those rows itself rather than trusting a winner that a comparator picked.
-  // MEASURED 0/156 in the toy cell; it will bite in a quieter one where every candidate is idle.
+  // 6-stream run purely from tie-breaking. `eval=0` => `phi_*` and `agree_*` carry NO information;
+  // a scorer must drop those rows, not count them.
+  // ⛔ AND `eval == 1` IS NOT SUFFICIENT ON ITS OWN: three candidates tied at the minimum and one
+  // higher is evaluable but its winner was still named by a tie-break. `mult_*` is the size of the
+  // tied set at the argmin. A SCORER MUST REQUIRE `eval_* == 1 && mult_* == 1`; anything less is
+  // scoring the tie-break.
   uint32_t mult_w = 0, mult_u = 0;
   for (const auto& c : cands) {
-    if (!better(cands[best_w], c, true) && !better(c, cands[best_w], true)) ++mult_w;
-    if (!better(cands[best_u], c, false) && !better(c, cands[best_u], false)) ++mult_u;
+    if (tied(c, cands[best_w], true)) ++mult_w;
+    if (tied(c, cands[best_u], false)) ++mult_u;
   }
+  const bool eval_w = mult_w < cands.size();
+  const bool eval_u = mult_u < cands.size();
   const uint64_t stock_id = (stock_choice != nullptr) ? stock_choice->id : 0;
-  // ⭐ Append only. No formatting, no I/O, no lock -- see the note on the ring in the header.
+  // ⭐ Append only. No formatting, no I/O, no lock, NO ALLOCATION -- see the note on the ring in
+  // the header and the eager reserve in Device::create.
   if (phi_trace_sel_.empty()) {
-    phi_trace_sel_.resize(kPhiTraceSel);
-    phi_trace_selq_.resize(kPhiTraceSelQ);
+    note_cost();
+    return;
   }
   const uint64_t si = phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed);
   PhiSelRec& r = phi_trace_sel_[si % kPhiTraceSel];
@@ -3630,11 +3727,14 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     qr.q = c.q->id;
     qr.n = c.n;
     qr.n_unk = c.n_unk;
+    qr.rc = c.rc;
+    qr.ded = c.ded;
     qr.Tw = static_cast<float>(c.Tw);
     qr.Hw = static_cast<float>(c.Hw);
     qr.Tu = static_cast<float>(c.Tu);
     qr.Hu = static_cast<float>(c.Hu);
   }
+  note_cost();
 }
 
 // ================================================================================================

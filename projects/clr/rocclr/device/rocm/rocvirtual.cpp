@@ -764,9 +764,12 @@ void VirtualGPU::PhiReport() const {
     rate_disp = 0;
     rate_ticks = 0;
   }
+  uint64_t shape_live = 0, shape_open = 0;
+  PhiShapeCensus(shape_live, shape_open);
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
           "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
-          "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu",
+          "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu "
+          "shape_live=%lu shape_open=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
@@ -774,7 +777,8 @@ void VirtualGPU::PhiReport() const {
           (unsigned long)phi_d_skipped_.load(std::memory_order_relaxed),
           (unsigned long)PhiWindowTicks(), (unsigned long)rate_disp, (unsigned long)rate_ticks,
           (unsigned long)phi_sweep_max_.load(std::memory_order_relaxed),
-          (unsigned long)phi_shape_overflow_.load(std::memory_order_relaxed));
+          (unsigned long)phi_shape_overflow_.load(std::memory_order_relaxed),
+          (unsigned long)shape_live, (unsigned long)shape_open);
 }
 
 uint64_t VirtualGPU::PhiNowTicks() {
@@ -820,17 +824,29 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
     const uint64_t s = slot.blk_sum;
     const uint64_t n = ++slot.blk_n;
     if (n < L) {
-      // ⛔ A PARTIAL BLOCK MUST NOT READ AS `d == 0`. The selector treats `d == 0` as "no estimate"
-      // and a graph-only ring then prices as free, which is the exact failure this whole path
-      // exists to avoid. Publish the running partial mean until the first block completes.
-      // ⭐ Refresh from the partial while NO complete block has ever been folded for this shape --
-      // not merely while `d_ticks == 0`. Otherwise the very first sample pins `d` until a whole
-      // block completes, which for a shape launched fewer than `L` times is never.
-      if (slot.folds == 0) {
-        phi_d_ticks_.store(s / n, std::memory_order_relaxed);
-      }
+      // ⛔⛔ DO NOT PUBLISH THE PARTIAL MEAN. It is phase-biased BY CONSTRUCTION -- the rotation
+      // cursor walks the graph in order, so the first `n` samples of a block are the first `n`
+      // kernels of the graph, not a sample of all of them -- and the bias is in the MERGE
+      // direction. MEASURED with `grafn` on this build: N=32 shapes x 480 reps gives 15 samples
+      // per shape against L = 16..78, and `d` reads 5,208 ticks; the SAME 32 shapes at 1,920 and
+      // 4,800 reps (60 and 150 samples per shape) read 19,697 and 19,731. Same at N=20: 5,213 at
+      // 240 reps, 18,975 at 480. ⇒ the governing condition is `samples_per_shape >= L`, NOT the
+      // size of the shape table; growing it 8 -> 256 moved the boundary and left the failure.
+      // ⛔ The earlier comment here ("a partial block must not read as d == 0, a graph-only ring
+      // then prices as free") is OBSOLETE and its premise was already retracted: `d == 0` is
+      // handled as `d` UNKNOWN, and an unknown `d` with a known rate is imputed `d := 1/rate`,
+      // i.e. rho == 1, an OVER-price. So leaving `d` unknown until a block completes moves this
+      // from a measured 3.8x UNDER-estimate (merge, unsafe) to a bounded over-estimate (spread,
+      // safe under CLAIM S). ⚠️ In a graph-heavy workload that means `d` may stay unknown for a
+      // long time -- `shape_open` in the readout is how you SEE that rather than infer it.
       phi_d_samples_.fetch_add(1, std::memory_order_relaxed);
       PhiNoteWindow(end);
+      // ⛔ PUBLISH ON THE PARTIAL PATH TOO. This early return is taken `L - 1` times out of every
+      // `L`, and for a graph shape with many kernels that is nearly always. Without it the slot's
+      // `d_ticks` and rate base only ever advance once per completed block, so the shadow selector
+      // sees a stream whose `d` is stale by up to a whole rotation -- and reads `d == 0` for the
+      // entire first block of a shape that HAS a partial estimate published locally.
+      PhiPublishSlot();
       return;
     }
     dur = s / n;
@@ -1879,7 +1895,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // rho/d == the dispatch rate. ⛔ Gated: at PHI=0 this is a stock-path atomic RMW on every
   // dispatch, bought for a counter nobody reads.
   if (phi_active) {
-    phi_dispatches_.fetch_add(1, std::memory_order_relaxed);
+    phi_dispatches_.fetch_add(1, std::memory_order_relaxed);  // [B3 deferred to its own stage]
   }
 
   // Wait on signal ?
@@ -2078,7 +2094,7 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
         }
       }
     }
-    phi_dispatches_.fetch_add(kernel_packets, std::memory_order_relaxed);
+    phi_dispatches_.fetch_add(kernel_packets, std::memory_order_relaxed);  // [B3 deferred]
 
     // ⭐⭐ GRAPH `d` WITHOUT THE PROFILING PATH. Pick ONE kernel packet to carry a Phi-only
     // completion signal. The existing recycle-point sampler in ActiveSignal() then harvests it for
@@ -2895,7 +2911,8 @@ VirtualGPU::~VirtualGPU() {
       dep_rate_disp = 0;
       dep_rate_ticks = 0;
     }
-    dev().PhiReleaseSlot(phi_slot_);
+    uint64_t shape_live = 0, shape_open = 0;
+    PhiShapeCensus(shape_live, shape_open);
     dev().PhiRecordStream(phi_dispatches_.load(std::memory_order_relaxed),
                           phi_d_ticks_.load(std::memory_order_relaxed),
                           phi_d_samples_.load(std::memory_order_relaxed),
@@ -2903,7 +2920,8 @@ VirtualGPU::~VirtualGPU() {
                           phi_d_skipped_.load(std::memory_order_relaxed), PhiWindowTicks(),
                           dep_rate_disp, dep_rate_ticks,
                           phi_sweep_max_.load(std::memory_order_relaxed),
-                          phi_shape_overflow_.load(std::memory_order_relaxed));
+                          phi_shape_overflow_.load(std::memory_order_relaxed),
+                          shape_live, shape_open);
   }
 
 
@@ -2966,6 +2984,17 @@ VirtualGPU::~VirtualGPU() {
       roc_device_.vgpus()[idx]->index_--;
     }
   }
+
+  // ⛔⛔ RELEASE THE SHADOW SLOT HERE, NOT AT THE TOP OF THE DESTRUCTOR. Between the top of
+  // ~VirtualGPU and this point the `tracking_created_` block calls AcquireHwQueueIfNeeded(), which
+  // can BIND a queue and therefore call PhiPublishSlot(). Released early, that write lands in a
+  // slot another thread may already have claimed -- the exact cross-stream attribution
+  // PhiReleaseSlot's own comment says it prevents. Releasing it immediately before the queue is
+  // released also keeps the census honest for as long as this stream really holds the queue.
+  // ⛔ And CLEAR the member: `phi_slot_` is read by PhiPublishSlot/PhiNoteDispatch, and anything
+  // that dispatches or binds after this point must be a no-op, not a write into someone else's row.
+  dev().PhiReleaseSlot(phi_slot_);
+  phi_slot_ = 0xFFFFFFFFu;
 
   if (gpu_queue_ != nullptr) {
     roc_device_.releaseQueue(gpu_queue_, cuMask_, cooperative_);
