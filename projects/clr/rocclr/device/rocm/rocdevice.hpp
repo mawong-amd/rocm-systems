@@ -872,6 +872,74 @@ class Device : public NullDevice {
     std::atomic<uint64_t> bypass_preferred{0};//!< returned via the `preferred` hint, selector unused
   };
   mutable PhiStats phi_stats_;
+
+  //! ⛔⛔ WHY THIS EXISTS INSTEAD OF ITERATING `vgpus()`. The shadow report runs inside
+  //! `getQueueFromPool`, which holds ONLY `active_queue_access_`. But `vgpus_` is a
+  //! `std::vector<VirtualGPU*>` that VirtualGPU's constructor `resize()`s and ~VirtualGPU
+  //! `erase()`s -- both under `vgpusAccess_`, a DIFFERENT monitor. Iterating it from here is
+  //! reallocation under a live iterator, i.e. a use-after-free, not the benign counter-tearing an
+  //! earlier comment of mine claimed. ⛔ And it cannot be fixed by taking `vgpusAccess_` here:
+  //! `createVirtualDevice` establishes the order `vgpusAccess_ -> active_queue_access_`, so that
+  //! would deadlock.
+  //! ⭐ A FIXED-CAPACITY array owned by the device sidesteps both: it is never resized, so there is
+  //! nothing to invalidate, and each slot is written only by its owning vgpu and read without any
+  //! lock. A dead vgpu clears its own slot. Worst case a reader sees a stale sample, which costs a
+  //! wrong LOG LINE -- which is what the original comment claimed and is now actually true.
+  //! ⚠️ Our probes could never have caught this: they create every stream up front and destroy them
+  //! all at the end. vLLM creates and destroys streams throughout a run.
+  static constexpr size_t kPhiMaxStreams = 256;
+  static constexpr uint32_t kPhiNoSlot = 0xFFFFFFFFu;
+  struct PhiStreamSlot {
+    std::atomic<uint64_t> queue_id{0};    //!< 0 = not bound / not live
+    std::atomic<uint64_t> d_ticks{0};
+    //! ⭐ The RATE BASE, not a computed rate. The reader divides against ITS OWN `t_ref`, so all
+    //! streams keep one common right edge and an idle stream DECAYS instead of going stale --
+    //! which is the whole point of the epoch machinery and would have been silently undone by
+    //! publishing a finished rate here.
+    std::atomic<uint64_t> base_start{0};
+    std::atomic<uint64_t> base_disp{0};
+    std::atomic<uint64_t> disp_now{0};
+    std::atomic<bool> claimed{false};
+  };
+  mutable PhiStreamSlot phi_slots_[kPhiMaxStreams];
+  mutable std::atomic<uint64_t> phi_slot_overflow_{0};
+
+ public:
+  //! ⛔ A STABLE slot, claimed for the vgpu's lifetime. `VirtualGPU::index()` CANNOT be used as the
+  //! key: ~VirtualGPU decrements the index of every later vgpu, so slots would silently re-point to
+  //! a different stream on any destruction.
+  uint32_t PhiClaimSlot() const {
+    for (size_t i = 0; i < kPhiMaxStreams; ++i) {
+      bool expected = false;
+      if (phi_slots_[i].claimed.compare_exchange_strong(expected, true,
+                                                        std::memory_order_acq_rel)) {
+        phi_slots_[i].queue_id.store(0, std::memory_order_relaxed);
+        return static_cast<uint32_t>(i);
+      }
+    }
+    phi_slot_overflow_.fetch_add(1, std::memory_order_relaxed);
+    return kPhiNoSlot;  // more live streams than slots: they are simply invisible to the shadow
+  }
+  void PhiReleaseSlot(uint32_t idx) const {
+    if (idx >= kPhiMaxStreams) return;
+    // ⛔ Clear the key BEFORE releasing the claim, so a reader can never attribute this stream's
+    // payload to whoever claims the slot next.
+    phi_slots_[idx].queue_id.store(0, std::memory_order_release);
+    phi_slots_[idx].claimed.store(false, std::memory_order_release);
+  }
+  void PhiPublishStream(uint32_t idx, uint64_t queue_id, uint64_t d_ticks, uint64_t base_start,
+                        uint64_t base_disp, uint64_t disp_now) const {
+    if (idx >= kPhiMaxStreams) return;
+    PhiStreamSlot& s = phi_slots_[idx];
+    // Payload before key: a reader seeing a live `queue_id` sees payload at least as new.
+    s.d_ticks.store(d_ticks, std::memory_order_relaxed);
+    s.base_disp.store(base_disp, std::memory_order_relaxed);
+    s.base_start.store(base_start, std::memory_order_relaxed);
+    s.disp_now.store(disp_now, std::memory_order_relaxed);
+    s.queue_id.store(queue_id, std::memory_order_release);
+  }
+
+ private:
   mutable std::atomic<uint64_t> phi_sel_seq_{0};  //!< decision key for T313SEL / T313SELQ
 
   //! ⭐ Per-stream estimator snapshots, deposited by ~VirtualGPU. ⛔ Printing only from

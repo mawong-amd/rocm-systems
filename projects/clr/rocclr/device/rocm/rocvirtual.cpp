@@ -811,8 +811,9 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   // ⭐ The period comes from the SIGNAL, not from the vgpu: the sample is harvested long after its
   // batch, and a stream may replay several graph shapes with different periods.
   const uint64_t L = sig->phi_cycle_len_;
-  if (L > 1) {
-    PhiShapeSlot& slot = PhiShape(L);
+  PhiShapeSlot* slot_p = (L > 1) ? PhiShape(L) : nullptr;
+  if (slot_p != nullptr) {
+    PhiShapeSlot& slot = *slot_p;
     slot.blk_sum += dur;
     const uint64_t s = slot.blk_sum;
     const uint64_t n = ++slot.blk_n;
@@ -849,6 +850,20 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
                      std::memory_order_relaxed);
   phi_d_samples_.fetch_add(1, std::memory_order_relaxed);
   PhiNoteWindow(end);
+  PhiPublishSlot();
+}
+
+// ⭐ Mirror this stream's state into the device's fixed-capacity slot array, which is what the
+// shadow selector reads. See Device::PhiPublishStream for why it may NOT read `vgpus()`.
+void VirtualGPU::PhiPublishSlot() const {
+  if (phi_slot_ == 0xFFFFFFFFu) {
+    return;  // more live streams than slots; this one is simply invisible to the shadow selector
+  }
+  uint64_t bs = 0, bd = 0, dn = 0;
+  PhiRateBase(bs, bd, dn);
+  const hsa_queue_t* q = gpu_queue_;
+  dev().PhiPublishStream(phi_slot_, (q != nullptr) ? q->id : 0,
+                         phi_d_ticks_.load(std::memory_order_relaxed), bs, bd, dn);
 }
 
 void VirtualGPU::HwQueueTracker::PhiSweepCompleted() {
@@ -1479,6 +1494,14 @@ void VirtualGPU::SetGpuQueue(hsa_queue_t* queue) {
     last_aql_packet_slot_ = kInvalidAqlSlot;
   }
   gpu_queue_ = queue;
+  // ⛔⛔ REPUBLISH ON EVERY BINDING CHANGE, INCLUDING UNBIND. The shadow slot holds the LAST
+  // published queue id, so without this a stream that has released its queue keeps counting as a
+  // member of it. MEASURED: that staleness reclassified 317 of 331 decisions as "all rings
+  // occupied" against a true 156 -- and the all-occupied fraction is the single number the whole
+  // design hinges on, so a stale membership view corrupts exactly the measurement we need.
+  if (dev().settings().queue_phi_ != 0) {
+    PhiPublishSlot();
+  }
 
   cached_read_dispatch_id_ = 0;
   // The cached queue-progress state belongs to the previously assigned HW queue. When the HW
@@ -1535,6 +1558,9 @@ bool VirtualGPU::ReacquireQueueExcluding(const std::unordered_set<uint64_t>& exc
     // not conditionally reclaiming under pressure.
     roc_device_.releaseQueue(gpu_queue_, std::vector<uint32_t>{}, false, true);
     gpu_queue_ = nullptr;
+    if (dev().settings().queue_phi_ != 0) {
+      PhiPublishSlot();
+    }
   }
   SetGpuQueue(roc_device_.AcquireActiveQueue(priority_, nullptr, &excluded_ids));
   return gpu_queue_ != nullptr;
@@ -2070,7 +2096,10 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
     if (eligible > 0 && numPackets > 1) {
       // ⛔ PER-SHAPE cursor. One cursor per vgpu does not describe a stream that replays graphs of
       // different sizes, and the block-mean built on it is then malformed.
-      const uint64_t rot = PhiShape(eligible).rot.fetch_add(1, std::memory_order_relaxed);
+      PhiShapeSlot* rot_slot = PhiShape(eligible);
+      const uint64_t rot = (rot_slot != nullptr)
+          ? rot_slot->rot.fetch_add(1, std::memory_order_relaxed)
+          : phi_batch_rot_fallback_.fetch_add(1, std::memory_order_relaxed);
       const uint64_t want = rot % eligible;  // rotate over TARGETABLE kernels
       uint64_t ordinal = 0;
       for (size_t i = 0; i + 1 < numPackets; ++i) {  // exclude the final packet
@@ -2839,6 +2868,10 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
   // Note: Virtual GPU device creation must be a thread safe operation
   roc_device_.vgpus_.resize(roc_device_.numOfVgpus_);
   roc_device_.vgpus_[index()] = this;
+  // ⭐ Claim a STABLE shadow slot. Keyed independently of index(), which shifts on any destruction.
+  if (roc_device_.settings().queue_phi_ != 0) {
+    phi_slot_ = roc_device_.PhiClaimSlot();
+  }
 }
 
 // ================================================================================================
@@ -2852,6 +2885,7 @@ VirtualGPU::~VirtualGPU() {
       dep_rate_disp = 0;
       dep_rate_ticks = 0;
     }
+    dev().PhiReleaseSlot(phi_slot_);
     dev().PhiRecordStream(phi_dispatches_.load(std::memory_order_relaxed),
                           phi_d_ticks_.load(std::memory_order_relaxed),
                           phi_d_samples_.load(std::memory_order_relaxed),

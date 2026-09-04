@@ -3402,6 +3402,8 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
                              const std::unordered_set<uint64_t>* excluded_ids) const {
   // ⭐ ONE common right edge for every stream. A per-stream edge makes an IDLE stream's window
   // short and its rate look HIGH, which is backwards.
+  // ⭐ Slots publish the rate BASE, not a finished rate, precisely so this edge is applied here and
+  // is shared by every stream in the decision.
   const uint64_t t_ref = VirtualGPU::PhiNowTicks();
   // ⛔⛔ EVERY LINE CARRIES ITS OWN DECISION KEY. The per-candidate lines are emitted AFTER their
   // summary, and a scorer that attaches them by parser state gets it wrong the moment anything
@@ -3425,14 +3427,23 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
       continue;  // stock would not pick it either; keep the comparison like-for-like
     }
     Cand c{q, 0, 0, 0.0, 0.0, 0.0, 0.0};
-    for (const auto* vg : vgpus()) {
-      if (vg == nullptr || vg->gpu_queue() != q) {
+    // ⛔ Read the device's fixed slot array, NEVER `vgpus()` -- that vector is resized/erased under
+    // a different monitor than the one held here. See Device::PhiPublishStream.
+    for (size_t si = 0; si < kPhiMaxStreams; ++si) {
+      const PhiStreamSlot& sl = phi_slots_[si];
+      if (sl.queue_id.load(std::memory_order_acquire) != q->id) {
         continue;
       }
       ++c.n;
-      uint64_t d = vg->PhiDTicks();
-      uint64_t dd = 0, dt = 0;
-      const bool have_rate = vg->PhiRate(t_ref, dd, dt) && dt > 0;
+      uint64_t d = sl.d_ticks.load(std::memory_order_relaxed);
+      // ⭐ Divide against OUR `t_ref`, shared by every stream in this decision. That is what makes
+      // an idle stream's rate DECAY rather than freeze at whatever it last published.
+      const uint64_t bs = sl.base_start.load(std::memory_order_relaxed);
+      const uint64_t bd = sl.base_disp.load(std::memory_order_relaxed);
+      const uint64_t dn = sl.disp_now.load(std::memory_order_relaxed);
+      const bool have_rate = (bs != 0 && t_ref > bs && dn >= bd);
+      const uint64_t dd = have_rate ? (dn - bd) : 0;
+      const uint64_t dt = have_rate ? (t_ref - bs) : 0;
       double rho = 1.0;
       if (d == 0) {
         // ⛔ `d` UNKNOWN is NEVER `d == 0`: that would price this ring's T_q at zero, i.e. FREE,

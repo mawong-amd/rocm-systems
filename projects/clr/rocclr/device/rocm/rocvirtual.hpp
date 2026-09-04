@@ -938,6 +938,7 @@ class VirtualGPU : public device::VirtualDevice {
   //! const + mutable: the tracker holds `gpu_` by const reference, and this is
   //! accounting/estimator state rather than observable queue state.
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
+  void PhiPublishSlot() const;  //!< mirror this stream's state where the shadow selector can read it
   //! Count a recycled signal the `is_dispatch` tag DECLINED -- the positive control for that tag.
   void PhiCountSkipped() const { phi_d_skipped_.fetch_add(1, std::memory_order_relaxed); }
 
@@ -981,6 +982,10 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
   mutable std::atomic<uint64_t> phi_d_skipped_{0};   //!< recycles declined by the is_dispatch tag
+  //! ⛔ STABLE slot for the shadow selector, claimed at construction and released at destruction.
+  //! NOT `index()`: ~VirtualGPU decrements the index of every LATER vgpu, so an index-keyed slot
+  //! silently re-points to a different stream the moment any stream is destroyed.
+  uint32_t phi_slot_ = 0xFFFFFFFFu;
   //! ⭐ ROTATION CURSOR for graph-batch `d` sampling. One Phi-only signal per batch, on a DIFFERENT
   //! kernel each launch. ⛔ Rotation is not a nicety: a FIXED index sees one kernel of the graph
   //! forever, and `d` enters `T_q` squared, so a pinned unrepresentative kernel is the failure that
@@ -1011,7 +1016,7 @@ class VirtualGPU : public device::VirtualDevice {
   //! partial -- MEASURED 6,200-6,440 ticks against ~20,000 for either shape alone, a 3.2x
   //! under-estimate, which is the MERGE direction and therefore the unsafe one. Probing gives every
   //! distinct shape its own slot while there is room.
-  static constexpr size_t kPhiShapes = 8;
+  static constexpr size_t kPhiShapes = 32;
   struct PhiShapeSlot {
     std::atomic<uint64_t> key{0};  //!< `eligible` this slot tracks; 0 = free
     std::atomic<uint64_t> rot{0};  //!< rotation cursor for THIS shape
@@ -1023,16 +1028,26 @@ class VirtualGPU : public device::VirtualDevice {
     uint64_t folds = 0;
   };
   mutable PhiShapeSlot phi_shapes_[kPhiShapes];
+  mutable std::atomic<uint64_t> phi_shape_overflow_{0};  //!< shapes that found no slot
+  mutable std::atomic<uint64_t> phi_batch_rot_fallback_{0};  //!< cursor for overflowed shapes
 
-  //! Slot for `eligible`: return the existing one, else claim a free one, else (table full) evict
-  //! the home slot. Eviction costs that shape its partial block, never a MIXED block.
-  PhiShapeSlot& PhiShape(uint64_t eligible) const {
+  //! Slot for `eligible`: the existing one, else a free one, else **nullptr**.
+  //! ⛔⛔ TABLE-FULL RETURNS nullptr AND THE CALLER SKIPS THE BLOCK-MEAN. It used to EVICT the home
+  //! slot, and that was the direct-mapped collision defect wearing a different hat: with more
+  //! distinct shapes than slots, the evicted shape never completes a block, `folds` stays 0, and
+  //! `d` freezes at a one-sample partial -- MEASURED 5,120-7,044 ticks against a truth of
+  //! 19,600-20,280 as soon as the shape count exceeded the table, a 2.8-3.9x UNDER-estimate, i.e.
+  //! the MERGE direction. Degrading to "no block-mean for this shape" instead is strictly the
+  //! pre-block-mean behaviour: aliased, but bounded and never 3.7x low.
+  //! ⚠️ vLLM keeps one hipGraph per batch-size bucket, so >8 shapes is the expected case, not a
+  //! corner: sized for that, and the caller must handle nullptr.
+  PhiShapeSlot* PhiShape(uint64_t eligible) const {
     const size_t home = static_cast<size_t>(eligible % kPhiShapes);
     for (size_t i = 0; i < kPhiShapes; ++i) {
       PhiShapeSlot& s = phi_shapes_[(home + i) % kPhiShapes];
       const uint64_t k = s.key.load(std::memory_order_relaxed);
       if (k == eligible) {
-        return s;
+        return &s;
       }
       if (k == 0) {
         s.key.store(eligible, std::memory_order_relaxed);
@@ -1040,16 +1055,11 @@ class VirtualGPU : public device::VirtualDevice {
         s.blk_sum = 0;
         s.blk_n = 0;
         s.folds = 0;
-        return s;
+        return &s;
       }
     }
-    PhiShapeSlot& s = phi_shapes_[home];
-    s.key.store(eligible, std::memory_order_relaxed);
-    s.rot.store(0, std::memory_order_relaxed);
-    s.blk_sum = 0;
-    s.blk_n = 0;
-    s.folds = 0;
-    return s;
+    phi_shape_overflow_.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;  // caller: no block-mean for this shape, NOT an evicted (and so starved) slot
   }
   //! ⭐⭐ THE TIME BASE FOR `H_q`, AND IT IS FREE. `H_q = sum rho/d = c/W` is a RATE, and
   //! `phi_dispatches_` above is a MONOTONIC COUNT. Without a base a stream that issued a million
@@ -1111,6 +1121,18 @@ class VirtualGPU : public device::VirtualDevice {
   //! ⛔ 0 is NOT "instant": a caller that treats it as a duration prices this stream's ring at
   //! T_q = 0, i.e. FREE, and Phi then piles every other stream onto it.
   uint64_t PhiDTicks() const { return phi_d_ticks_.load(std::memory_order_relaxed); }
+
+  //! The rate BASE (epoch start, and the dispatch count at that instant) plus the live count, for
+  //! a reader that will divide against its own common `t_ref`.
+  void PhiRateBase(uint64_t& base_start, uint64_t& base_disp, uint64_t& disp_now) const {
+    base_start = phi_ep_prev_start_.load(std::memory_order_relaxed);
+    base_disp = phi_ep_prev_disp_.load(std::memory_order_relaxed);
+    if (base_start == 0) {
+      base_start = phi_ep_cur_start_.load(std::memory_order_relaxed);
+      base_disp = phi_ep_cur_disp_.load(std::memory_order_relaxed);
+    }
+    disp_now = phi_dispatches_.load(std::memory_order_relaxed);
+  }
 
   //! Span of the live observation window in ticks; 0 = unknown. Readout only.
   uint64_t PhiWindowTicks() const {
