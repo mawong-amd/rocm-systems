@@ -756,6 +756,15 @@ bool VirtualGPU::HwQueueTracker::Create() {
 // ⭐ Fold one completed packet's duration into this stream's `d` estimate.
 // Units are RAW AGENT TICKS and are never translated: Phi is dimensionless (T carries units of d,
 // H carries 1/d), so a tick->ns conversion would buy nothing and could only introduce error.
+void VirtualGPU::PhiReport() const {
+  ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
+          (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
+          (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
+          (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
+          (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed));
+}
+
 void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   if (sig == nullptr) return;
   sig->CacheTimingData(gpu_device());
@@ -764,8 +773,14 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   // ⛔ Reject rather than clamp. The runtime already warns that the CP can leave start/end zero or
   // inverted; folding a bad reading into an EWMA corrupts every later sample, and a silently
   // clamped zero is indistinguishable from a real short kernel.
-  if (start == 0 || end == 0 || end <= start) {
-    ++phi_d_rejected_;
+  // ⛔ Reject rather than clamp, at BOTH ends. The runtime warns the CP can leave start/end zero or
+  // inverted (lower bound). The UPPER bound matters too: the EWMA is seeded by its first sample and
+  // otherwise bounded by the largest value folded in, so one enormous reading leaves `d` wrong for
+  // up to ~250 samples. 1e12 ticks is ~1000 s at ~1 tick/ns -- far above any real kernel, far below
+  // the 2.6e18 point where the EWMA's own multiply would wrap.
+  static constexpr uint64_t kMaxPlausibleDurTicks = 1000000000000ull;
+  if (start == 0 || end == 0 || end <= start || (end - start) > kMaxPlausibleDurTicks) {
+    phi_d_rejected_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   const uint64_t dur = end - start;
@@ -774,12 +789,15 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   //   `phi_d_ticks_ + (dur - phi_d_ticks_) / 8`
   // UNDERFLOWS whenever dur < phi_d_ticks_ -- these are uint64_t -- and pins the estimate near
   // UINT64_MAX. That was measured, not imagined: the first build read d_ticks = 1.8e19.
-  phi_d_ticks_ = (phi_d_samples_ == 0) ? dur : (phi_d_ticks_ * 7 + dur) / 8;
-  ++phi_d_samples_;
+  const uint64_t prev = phi_d_ticks_.load(std::memory_order_relaxed);
+  const uint64_t n = phi_d_samples_.load(std::memory_order_relaxed);
+  phi_d_ticks_.store((n == 0) ? dur : (prev * 7 + dur) / 8, std::memory_order_relaxed);
+  phi_d_samples_.fetch_add(1, std::memory_order_relaxed);
 }
 
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_val, Timestamp* ts,
-                                                      bool attach_signal, bool is_dispatch) {
+                                                      bool attach_signal, bool is_dispatch,
+                                                      bool phi_only) {
   amd::Command* cmd = gpu_.command();
   // If no signal is needed, decrement the refcount and clear the hw_event of current command
   if (!attach_signal) {
@@ -893,8 +911,24 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
   prof_signal->ReleaseOrderingEdge();
   prof_signal->ResetCachedTiming();
 
-  // Release any existing HwEvent before setting new one for the same command
-  VirtualGPU::AttachHwEvent(cmd, prof_signal);
+  // Release any existing HwEvent before setting new one for the same command.
+  // ⭐⭐ A Phi-ONLY signal must NOT become the command's HW event. The caller passed no Timestamp and
+  // did not ask for a signal, so in stock this command has no HW event at all -- clearing is stock's
+  // own answer, not an expedient. ⛔ And this is the ENTIRE cost of forcing: attaching it costs +91%
+  // on period (9.93 vs 5.21 us stock) while skipping it costs 0% (5.200 us). MEASURED by ablation.
+  // ⚠️ The CAUSE is not understood -- why one retained ProfilingSignal makes every LATER dispatch
+  // ~3 us slower. If that cost is real on the ordinary path it is a pre-existing clr defect and a
+  // bigger deal than this policy. Tracked in work/task313/ODDITIES.md #1; get the story before any PR.
+  if (phi_only) {
+    if (cmd != nullptr) {
+      if (cmd->HwEvent() != nullptr) {
+        reinterpret_cast<ProfilingSignal*>(cmd->HwEvent())->release();
+      }
+      cmd->SetHwEvent(nullptr);
+    }
+  } else {
+    VirtualGPU::AttachHwEvent(cmd, prof_signal);
+  }
 
   if (ts != nullptr) {
     // Save HSA signal earlier to make sure the possible callback will have a valid
@@ -1611,11 +1645,14 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // optimisation to be fitted against a quality curve, not a design-time guess.
   const bool phi_wants_signal = dev().settings().queue_phi_ != 0 &&
                                 dev().settings().max_hw_queues_ <= dev().NumHwPipes();
-  bool attachSignal = timestamp_ != nullptr || attach_signal || phi_wants_signal;
+  const bool caller_wants_signal = timestamp_ != nullptr || attach_signal;
+  bool attachSignal = caller_wants_signal || phi_wants_signal;
+  // True when this packet carries a completion signal ONLY because the estimator asked for one.
+  const bool phi_only_signal = phi_wants_signal && !caller_wants_signal;
   // Get active signal for current dispatch if profiling is necessary
   packet->completion_signal =
       Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal,
-                              /*is_dispatch=*/true);
+                              /*is_dispatch=*/true, /*phi_only=*/phi_only_signal);
 
   if (timestamp_ != nullptr) {
     // If profiling is enabled, store the correlation ID in the dispatch packet. The profiler
@@ -1642,7 +1679,16 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
     blocking = true;
   }
 
-  TrackQueueProgress(*packet, index);
+  // ⭐⭐ Do NOT let a Phi-only signal mark the queue idle-trackable.
+  // `last_packet_with_signal_index_` is the SOLE precondition IsQueueIdle() needs, and IsQueueIdle()
+  // gates ReleaseHwQueue(), so recording it here turns the estimator into a 25-46x change in
+  // release/reacquire churn (MEASURED: 50 -> 2298 queue selections, and not reproducible with
+  // itself). Skipping restores stock EXACTLY: 50/63 in both arms. Semantically stock -- that packet
+  // carries no signal in stock, so "not idle-trackable" is stock's own answer.
+  // ⚠️ Prior art (UPSTREAM-DRAFT.md:1786): IsQueueIdle()'s `false` conflates "idleness unknowable"
+  // with "genuinely busy", and forcing signals flips it from always-false to always-true. Both are
+  // instrument pathologies that have already invalidated three experiments. This sits in NEITHER.
+  TrackQueueProgress(*packet, index, /*skip_signal=*/phi_only_signal);
 
   AqlPacket* aql_loc = &((AqlPacket*)(gpu_queue_->base_address))[index & queueMask];
   writePacketToRingBuffer(aql_loc, packet, header, rest, index & queueMask);
@@ -1680,7 +1726,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // Mark the flag indicating if a dispatch is outstanding.
   // We are not waiting after every dispatch.
   hasPendingDispatch_ = true;
-  ++phi_dispatches_;  // rho/d == dispatch rate: the free half of Phi
+  phi_dispatches_.fetch_add(1, std::memory_order_relaxed);  // rho/d == the dispatch rate
 
   // Wait on signal ?
   if (blocking) {
@@ -1829,6 +1875,31 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
   const size_t numPackets = validFullHeaders.size();
   if (flatPacketData.size() != numPackets * 64) {
     return false;
+  }
+
+  // ⭐⭐ COUNT THE GRAPH'S KERNEL DISPATCHES. Without this a saturating graph stream reads
+  // `dispatches=0` while plain streams read their true count -- MEASURED: half the device's
+  // dispatch load invisible to Phi, and with FORCE_GRAPH_QUEUES=4 at cap 4 *every* ring carries a
+  // graph stream. `H_q` is the half of Phi that says a ring is loaded at all, and it is free here:
+  // one pass over headers we already have.
+  // ⛔ We deliberately do NOT force a completion signal on the batch tail to get `d`: it HANGS on
+  // segmented graphs (reproducible), and even where it survives the tail is not one kernel
+  // (3 samples reading 38333 ticks against a true ~5 us kernel). Graph streams therefore
+  // contribute to H_q and not to T_q until a per-kernel_object `d` cache lands.
+  if (dev().settings().queue_phi_ != 0) {
+    uint64_t kernel_packets = 0;
+    for (size_t i = 0; i < numPackets; ++i) {
+      const uint16_t hdr = static_cast<uint16_t>(validFullHeaders[i]);
+      const uint8_t pktType =
+          extractAqlBits(hdr, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
+      const uint8_t amdFormat = static_cast<uint8_t>((validFullHeaders[i] >> 16) & 0xFF);
+      if (pktType == HSA_PACKET_TYPE_KERNEL_DISPATCH ||
+          (pktType == HSA_PACKET_TYPE_VENDOR_SPECIFIC &&
+           amdFormat == HSA_AMD_PACKET_TYPE_EXT_KERNEL_DISPATCH)) {
+        ++kernel_packets;
+      }
+    }
+    phi_dispatches_.fetch_add(kernel_packets, std::memory_order_relaxed);
   }
 
   static constexpr size_t kMetaPktSize =
@@ -2529,14 +2600,13 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
 
 // ================================================================================================
 VirtualGPU::~VirtualGPU() {
-  // ⭐ Per-stream estimator readout. Printed for every stream so a starved or never-sampled one is
-  // visible, not averaged away. `d` is in AGENT TICKS by design (Phi is dimensionless).
   if (dev().settings().queue_phi_ != 0) {
-    ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-            "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
-            (unsigned long)phi_dispatches_, (unsigned long)phi_d_ticks_,
-            (unsigned long)phi_d_samples_, (unsigned long)phi_d_rejected_);
+    dev().PhiRecordStream(phi_dispatches_.load(std::memory_order_relaxed),
+                          phi_d_ticks_.load(std::memory_order_relaxed),
+                          phi_d_samples_.load(std::memory_order_relaxed),
+                          phi_d_rejected_.load(std::memory_order_relaxed));
   }
+
 
   // Release SDMA engine assignment for this VirtualGPU
   ReleaseSdmaEngines();

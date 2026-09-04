@@ -215,6 +215,21 @@ void Device::checkAtomicSupport() {
 
 Device::~Device() {
   if (settings().queue_phi_ != 0) {
+    // ⛔ Print the PER-STREAM readout from HERE, over the live vgpu list -- NOT from ~VirtualGPU.
+    // A readout that only fires for streams the program bothered to destroy silently omits exactly
+    // the streams under study: a run without hipStreamDestroy printed one line for nine streams.
+    {  // survivors first (streams never destroyed), then the deposits
+      for (const auto* vg : vgpus()) {
+        if (vg != nullptr) vg->PhiReport();
+      }
+      amd::ScopedLock l(phi_streams_lock_);
+      for (const auto& v : phi_streams_) {
+        ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+                "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
+                (unsigned long)v.dispatches, (unsigned long)v.d_ticks,
+                (unsigned long)v.samples, (unsigned long)v.rejected);
+      }
+    }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "T313PHI mode=%u cap=%u pipes=%u reached=%lu eligible=%lu declined_regime=%lu "
             "bypass_preferred=%lu",

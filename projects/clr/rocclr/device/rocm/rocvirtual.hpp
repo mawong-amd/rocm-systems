@@ -283,7 +283,7 @@ class VirtualGPU : public device::VirtualDevice {
     //! Finds a free signal for the upcoming operation
     hsa_signal_t ActiveSignal(hsa_signal_value_t init_val = kInitSignalValueOne,
                               Timestamp* ts = nullptr, bool attach_signal = true,
-                             bool is_dispatch = false);
+                             bool is_dispatch = false, bool phi_only = false);
 
     //! Wait for the curent active signal. Can idle the queue
     bool WaitCurrent();
@@ -658,6 +658,10 @@ class VirtualGPU : public device::VirtualDevice {
   void enableSyncBlit() const;
 
   void hasPendingDispatch() { hasPendingDispatch_ = true; }
+  //! Per-stream estimator readout. PUBLIC because ~Device prints it over the LIVE vgpu list;
+  //! printing from ~VirtualGPU omits every stream the program never destroyed.
+  void PhiReport() const;
+
   bool IsPendingDispatch() const { return (hasPendingDispatch_) ? true : false; }
   void addSystemScope() override {
     addSystemScope_ = true;
@@ -909,10 +913,19 @@ class VirtualGPU : public device::VirtualDevice {
   //! accounting/estimator state rather than observable queue state.
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
 
-  mutable uint64_t phi_dispatches_ = 0;  //!< monotonic dispatch count for this stream
-  mutable uint64_t phi_d_ticks_ = 0;     //!< EWMA of completed-packet duration, agent ticks
-  mutable uint64_t phi_d_samples_ = 0;   //!< samples folded in
-  mutable uint64_t phi_d_rejected_ = 0;  //!< completed packets whose timing was unusable
+  //! ⛔ ATOMIC because slice C will read ANOTHER stream's counters from
+  //! Device::getQueueFromPool, which runs under `active_queue_access_` -- a DIFFERENT monitor from
+  //! this vgpu's execution(). Writers are single-threaded today, so this is not a live race; it
+  //! becomes one the moment the selector lands, and it would present as a policy bug.
+  mutable std::atomic<uint64_t> phi_dispatches_{0};  //!< dispatch count for this stream
+  mutable std::atomic<uint64_t> phi_d_ticks_{0};     //!< EWMA of packet duration, agent ticks
+  mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
+  mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
+  //! ⭐ `H_q = sum rho/d = c/W` is a RATE, and a monotonic count is not one. Without a time base a
+  //! stream that issued a million dispatches an hour ago and is now idle is indistinguishable from
+  //! a saturating one -- the same per-binding defect this campaign already retired once. The
+  //! selector computes `rate = phi_dispatches_ / (now - phi_epoch_ns_)`.
+  uint64_t phi_epoch_ns_ = 0;  //!< when counting for the current window began
 
   Timestamp* timestamp_;
   bool sdma_profiling_for_cmd_ = false;  //!< SDMA profiling enabled for current command
