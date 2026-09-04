@@ -766,13 +766,15 @@ void VirtualGPU::PhiReport() const {
   }
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
           "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
-          "win_ticks=%lu rate_disp=%lu rate_ticks=%lu",
+          "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_skipped_.load(std::memory_order_relaxed),
-          (unsigned long)PhiWindowTicks(), (unsigned long)rate_disp, (unsigned long)rate_ticks);
+          (unsigned long)PhiWindowTicks(), (unsigned long)rate_disp, (unsigned long)rate_ticks,
+          (unsigned long)phi_sweep_max_.load(std::memory_order_relaxed),
+          (unsigned long)phi_shape_overflow_.load(std::memory_order_relaxed));
 }
 
 uint64_t VirtualGPU::PhiNowTicks() {
@@ -874,10 +876,17 @@ void VirtualGPU::HwQueueTracker::PhiSweepCompleted() {
   // signal AT current_id_, so the armed history runs BACKWARD in both the recycle and the growth
   // regimes. Sweeping forward from +1 walks the never-armed tail of the original pool and finds
   // almost nothing -- measured 3 -> 5 samples instead of 3 -> 197.
+  // ⚠️ The budget is structurally bounded but UNTESTED at depth: the `continue` on a still-running
+  // signal means the early break does not fire until the walk is past the in-flight head, so the
+  // worst case is a deep backlog with many in flight -- precisely the regime the sweep exists for.
+  // Our pools only ever reached ~70 and ~270. `max_visited` is reported so the bound is observed
+  // rather than assumed before the vLLM run.
   static constexpr size_t kSweepBudget = 1024;
   const size_t n = signal_list_.size();
   size_t idx = current_id_;
+  size_t visited = 0;
   for (size_t step = 0; step < std::min(n, kSweepBudget); ++step) {
+    ++visited;
     idx = (idx == 0) ? (n - 1) : (idx - 1);
     ProfilingSignal* sig = signal_list_[idx];
     if (sig == nullptr) {
@@ -901,6 +910,7 @@ void VirtualGPU::HwQueueTracker::PhiSweepCompleted() {
       gpu_.PhiCountSkipped();
     }
   }
+  gpu_.PhiNoteSweepDepth(visited);
 }
 
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_val, Timestamp* ts,
@@ -2891,7 +2901,9 @@ VirtualGPU::~VirtualGPU() {
                           phi_d_samples_.load(std::memory_order_relaxed),
                           phi_d_rejected_.load(std::memory_order_relaxed),
                           phi_d_skipped_.load(std::memory_order_relaxed), PhiWindowTicks(),
-                          dep_rate_disp, dep_rate_ticks);
+                          dep_rate_disp, dep_rate_ticks,
+                          phi_sweep_max_.load(std::memory_order_relaxed),
+                          phi_shape_overflow_.load(std::memory_order_relaxed));
   }
 
 

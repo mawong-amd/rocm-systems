@@ -941,6 +941,12 @@ class VirtualGPU : public device::VirtualDevice {
   void PhiPublishSlot() const;  //!< mirror this stream's state where the shadow selector can read it
   //! Count a recycled signal the `is_dispatch` tag DECLINED -- the positive control for that tag.
   void PhiCountSkipped() const { phi_d_skipped_.fetch_add(1, std::memory_order_relaxed); }
+  //! High-water mark of the drain-point sweep, so its budget is observed rather than assumed.
+  void PhiNoteSweepDepth(uint64_t v) const {
+    uint64_t m = phi_sweep_max_.load(std::memory_order_relaxed);
+    while (v > m && !phi_sweep_max_.compare_exchange_weak(m, v, std::memory_order_relaxed)) {
+    }
+  }
 
   //! Widen the observation window to include `end`.
   //! ⛔⛔ MIN/MAX, NOT FIRST/LAST. Samples do NOT arrive in chronological order: the drain-point
@@ -982,6 +988,7 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
   mutable std::atomic<uint64_t> phi_d_skipped_{0};   //!< recycles declined by the is_dispatch tag
+  mutable std::atomic<uint64_t> phi_sweep_max_{0};  //!< deepest drain-point sweep walk
   //! ⛔ STABLE slot for the shadow selector, claimed at construction and released at destruction.
   //! NOT `index()`: ~VirtualGPU decrements the index of every LATER vgpu, so an index-keyed slot
   //! silently re-points to a different stream the moment any stream is destroyed.
@@ -1108,9 +1115,12 @@ class VirtualGPU : public device::VirtualDevice {
   //! Dispatch rate over [epoch base, t_ref] as an exact fraction, so no division happens here.
   //! Returns false for "rate UNKNOWN", which the caller must NOT treat as a rate of zero.
   bool PhiRate(uint64_t t_ref, uint64_t& disp_delta, uint64_t& tick_delta) const {
-    // ⛔⛔ READ ORDER IS LOAD-BEARING: epoch base FIRST, `phi_dispatches_` SECOND. The other order
-    // lets a concurrent roll install a base NEWER than the count already read, and
-    // `disp_now - base_disp` UNDERFLOWS to ~1e19 -- an infinitely busy stream.
+    // ⛔ READ ORDER: epoch base FIRST, `phi_dispatches_` SECOND. ⚠️ CORRECTION to what an earlier
+    // comment of mine claimed: the wrong order does NOT produce a 1e19 rate, because the
+    // `disp_now < base_disp` guard below catches it on the very next line. What the order actually
+    // buys is AVAILABILITY -- wrong order means the guard fires, the rate reads UNKNOWN, and the
+    // selector flaps, which is the thing the two-epoch design exists to prevent. Defence in depth,
+    // not a safety property.
     uint64_t base_start = phi_ep_prev_start_.load(std::memory_order_relaxed);
     uint64_t base_disp = phi_ep_prev_disp_.load(std::memory_order_relaxed);
     if (base_start == 0) {  // fewer than two epochs yet; fall back to the current one
@@ -1126,6 +1136,13 @@ class VirtualGPU : public device::VirtualDevice {
     return true;
   }
 
+  //! ⚠️ On the rho clamp (in the shadow reader): `rho = rate * d` is clamped to 1, and when it
+  //! fires -- rho > 1 <=> rate > 1/d -- the stream's contribution to `H_q` changes from `rate` to
+  //! `1/d`, which is SMALLER. So a saturated or `d`-over-estimated stream is priced BELOW its own
+  //! measured rate. Defensible (rho <= 1 is physics) but it silently changes WHICH quantity ranks
+  //! the ring. MEASURED: 0 clamps in 1,092 opportunities, so this is a note, not a live effect.
+  //! ⚠️ And a stream slower than one dispatch per epoch rolls on EVERY sample, so `disp_delta` ~ 1
+  //! and its rate is very coarse. An honest limit of the epoch design, not a bug.
   //! The stream's contended service interval `d`, in raw agent ticks. 0 = UNKNOWN.
   //! ⛔ 0 is NOT "instant": a caller that treats it as a duration prices this stream's ring at
   //! T_q = 0, i.e. FREE, and Phi then piles every other stream onto it.

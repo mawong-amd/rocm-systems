@@ -896,6 +896,12 @@ class Device : public NullDevice {
     //! streams keep one common right edge and an idle stream DECAYS instead of going stale --
     //! which is the whole point of the epoch machinery and would have been silently undone by
     //! publishing a finished rate here.
+    //! ⛔ SEQLOCKED as a PAIR. Read separately, a tear gives an OLD start with a NEW disp -- window
+    //! too wide, count too small, so the rate reads too LOW. A low rate lowers rho, lowers `H_q`,
+    //! and makes the ring look MORE attractive: the MERGE direction, which is the unsafe one. An
+    //! earlier comment of mine called that "harmless: a slightly low rate"; the magnitude is
+    //! bounded to one epoch but the DIRECTION is the wrong one, so it is closed rather than noted.
+    std::atomic<uint64_t> seq{0};  //!< odd = write in progress
     std::atomic<uint64_t> base_start{0};
     std::atomic<uint64_t> base_disp{0};
     std::atomic<uint64_t> disp_now{0};
@@ -903,6 +909,12 @@ class Device : public NullDevice {
   };
   mutable PhiStreamSlot phi_slots_[kPhiMaxStreams];
   mutable std::atomic<uint64_t> phi_slot_overflow_{0};
+  //! ⛔ Highest claimed slot + 1. Without it the reader scans all `kPhiMaxStreams` slots per
+  //! candidate -- 1024 atomic loads per decision at 4 candidates, REGARDLESS of how many streams
+  //! are live, which is worse than the vgpu scan it replaced at small stream counts. Monotone: it
+  //! never shrinks when a slot is released, so a long-lived process pays for its peak, not its
+  //! current, stream count. Acceptable and bounded; noted rather than optimised.
+  mutable std::atomic<uint32_t> phi_slot_hi_{0};
 
  public:
   //! ⛔ A STABLE slot, claimed for the vgpu's lifetime. `VirtualGPU::index()` CANNOT be used as the
@@ -914,6 +926,10 @@ class Device : public NullDevice {
       if (phi_slots_[i].claimed.compare_exchange_strong(expected, true,
                                                         std::memory_order_acq_rel)) {
         phi_slots_[i].queue_id.store(0, std::memory_order_relaxed);
+        uint32_t hi = phi_slot_hi_.load(std::memory_order_relaxed);
+        while (hi < i + 1 && !phi_slot_hi_.compare_exchange_weak(hi, static_cast<uint32_t>(i + 1),
+                                                                std::memory_order_relaxed)) {
+        }
         return static_cast<uint32_t>(i);
       }
     }
@@ -931,11 +947,14 @@ class Device : public NullDevice {
                         uint64_t base_disp, uint64_t disp_now) const {
     if (idx >= kPhiMaxStreams) return;
     PhiStreamSlot& s = phi_slots_[idx];
-    // Payload before key: a reader seeing a live `queue_id` sees payload at least as new.
+    const uint64_t g = s.seq.load(std::memory_order_relaxed);
+    s.seq.store(g + 1, std::memory_order_release);  // odd: write in progress
     s.d_ticks.store(d_ticks, std::memory_order_relaxed);
     s.base_disp.store(base_disp, std::memory_order_relaxed);
     s.base_start.store(base_start, std::memory_order_relaxed);
     s.disp_now.store(disp_now, std::memory_order_relaxed);
+    s.seq.store(g + 2, std::memory_order_release);  // even: consistent
+    // Payload before key: a reader seeing a live `queue_id` sees payload at least as new.
     s.queue_id.store(queue_id, std::memory_order_release);
   }
 
@@ -953,7 +972,7 @@ class Device : public NullDevice {
   //! ⚠️ An unclean kill (SIGKILL of a server) loses the trace entirely. Arrange a clean shutdown.
   struct PhiSelRec {
     uint64_t seq, stock, phi_w, phi_u;
-    uint32_t cands, n_free, n_meas;
+    uint32_t cands, n_free, n_meas, mult_w, mult_u;
     int8_t eval_w, eval_u, agree_w, agree_u, wu_same, via_bypass;
   };
   struct PhiSelQRec {
@@ -979,17 +998,17 @@ class Device : public NullDevice {
   //! misses ALL of them, because `vgpus_` is already empty by then (verified: the device line
   //! prints, the per-stream lines do not). The union of the two covers both.
   struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, samples, rejected, skipped, win,
-                             rate_disp, rate_ticks; };
+                             rate_disp, rate_ticks, sweep_max, shape_ovf; };
   mutable std::vector<PhiStreamSnapshot> phi_streams_;
   mutable amd::Monitor phi_streams_lock_;
 
  public:
   void PhiRecordStream(uint64_t dispatches, uint64_t d_ticks, uint64_t samples, uint64_t rejected,
-                       uint64_t skipped, uint64_t win, uint64_t rate_disp,
-                       uint64_t rate_ticks) const {
+                       uint64_t skipped, uint64_t win, uint64_t rate_disp, uint64_t rate_ticks,
+                       uint64_t sweep_max, uint64_t shape_ovf) const {
     amd::ScopedLock l(phi_streams_lock_);
     phi_streams_.push_back({dispatches, d_ticks, samples, rejected, skipped, win, rate_disp,
-                            rate_ticks});
+                            rate_ticks, sweep_max, shape_ovf});
   }
 
  private:
