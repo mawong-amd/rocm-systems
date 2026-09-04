@@ -296,6 +296,12 @@ class VirtualGPU : public device::VirtualDevice {
     //! Wait for the curent active signal. Can idle the queue
     bool WaitCurrent();
 
+    //! ⭐ Harvest `d` from signals that completed while the pool was GROWING rather than recycling.
+    //! ⛔ NEVER waits: it tests each signal with a non-blocking load and skips any still running.
+    //! Call only where completion has already been established by a wait the runtime was doing
+    //! anyway (i.e. after WaitCurrent() in releaseGpuMemoryFence), never on the dispatch path.
+    void PhiSweepCompleted();
+
     //! Update current active engine
     void SetActiveEngine(HwQueueEngine engine = HwQueueEngine::Compute) { engine_ = engine; }
     HwQueueEngine GetActiveEngine() const { return engine_; }
@@ -934,6 +940,22 @@ class VirtualGPU : public device::VirtualDevice {
   //! Count a recycled signal the `is_dispatch` tag DECLINED -- the positive control for that tag.
   void PhiCountSkipped() const { phi_d_skipped_.fetch_add(1, std::memory_order_relaxed); }
 
+  //! Widen the observation window to include `end`.
+  //! ⛔⛔ MIN/MAX, NOT FIRST/LAST. Samples do NOT arrive in chronological order: the drain-point
+  //! sweep walks the signal pool BACKWARD, so it delivers DECREASING `end` timestamps. A first/last
+  //! window therefore inverts and `PhiWindowTicks()` reads 0 -- MEASURED `win_ticks=0` on every
+  //! deep-backlog run, i.e. the rate was lost in exactly the regime the sweep exists to serve.
+  void PhiNoteWindow(uint64_t end) const {
+    uint64_t f = phi_d_window_first_.load(std::memory_order_relaxed);
+    if (f == 0 || end < f) {
+      phi_d_window_first_.store(end, std::memory_order_relaxed);
+    }
+    uint64_t l = phi_d_window_last_.load(std::memory_order_relaxed);
+    if (end > l) {
+      phi_d_window_last_.store(end, std::memory_order_relaxed);
+    }
+  }
+
   //! ⛔ ATOMIC because slice C will read ANOTHER stream's counters from
   //! Device::getQueueFromPool, which runs under `active_queue_access_` -- a DIFFERENT monitor from
   //! this vgpu's execution(). Writers are single-threaded today, so this is not a live race; it
@@ -948,7 +970,27 @@ class VirtualGPU : public device::VirtualDevice {
   //! forever, and `d` enters `T_q` squared, so a pinned unrepresentative kernel is the failure that
   //! killed the pre-patched-signal route (unbounded BOTH ways -- 24.4x over, 0.010x under).
   //! Rotating makes the EWMA converge to the mean over kernels, which is the quantity `T_q` wants.
+  //! ⛔ Rotating ALONE is not sufficient -- see the block-mean below.
   mutable std::atomic<uint32_t> phi_batch_rot_{0};
+  //! ⛔⛔ THE BLOCK-MEAN, AND IT IS NOT AN OPTIMISATION -- IT CLOSES AN ALIASING DEFECT. The cursor
+  //! walks the graph with period `phi_cycle_len_` while the EWMA remembers ~8 samples. When kernel
+  //! duration is CORRELATED WITH INDEX AT LOW FREQUENCY (first half cheap, second half dear) the
+  //! EWMA tracks whichever half the cursor is in: MEASURED 33,067 vs 7,518 ticks on IDENTICAL work,
+  //! a 4.40x swing decided by nothing but how many launches had happened -- and `d` enters `T_q`
+  //! SQUARED, so 19.4x in the Phi term.
+  //! ⭐ The repair: average one FULL rotation period, then fold that mean into the EWMA. A block of
+  //! `cycle_len` consecutive samples visits every targetable kernel exactly once, so it is a
+  //! STRATIFIED sample regardless of phase -- the index-correlation term goes identically, not
+  //! statistically. Swing 4.40x -> 1.002x, and 3% MORE accurate on the alternating case too.
+  //! ⛔ Hashing the index instead only reaches 1.46x: randomising is not stratifying, because a hash
+  //! of a counter is still a deterministic sequence and the EWMA still sees only 8 of them.
+  //! ⛔⛔ The alternating (period-2) case the original commit validated with is the ONE pattern this
+  //! aliasing CANNOT bite -- the EWMA averages consecutive alternating samples perfectly. Never
+  //! re-validate this with an alternating graph alone; use an index-correlated one.
+  mutable std::atomic<uint64_t> phi_cycle_len_{1};   //!< rotation period = targetable kernels/batch
+  mutable std::atomic<uint64_t> phi_blk_sum_{0};     //!< running sum of the current block
+  mutable std::atomic<uint64_t> phi_blk_n_{0};       //!< samples in the current block
+  mutable std::atomic<uint64_t> phi_blk_folds_{0};   //!< completed blocks folded into the EWMA
   //! ⭐⭐ THE TIME BASE FOR `H_q`, AND IT IS FREE. `H_q = sum rho/d = c/W` is a RATE, and
   //! `phi_dispatches_` above is a MONOTONIC COUNT. Without a base a stream that issued a million
   //! dispatches an hour ago and is now idle is indistinguishable from a saturating one -- the same

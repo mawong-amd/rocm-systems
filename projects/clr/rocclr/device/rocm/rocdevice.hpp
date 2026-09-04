@@ -72,6 +72,10 @@ class ProfilingSignal : public amd::ReferenceCountedObject {
   //! estimator folds in dispatches only: a barrier's start->end is not a service interval, and
   //! mixing the two was MEASURED to inflate `d` by a fixed ~8.6 us while leaving the slope right.
   bool phi_is_dispatch_ = false;
+  //! ⭐ True once the `d` estimator has taken this signal's timing, so the recycle-point harvest and
+  //! the drain-point sweep cannot double-count the same packet. Defaults TRUE: a signal nobody armed
+  //! for Phi must never look like an unharvested sample.
+  bool phi_harvested_ = true;
   std::recursive_mutex lock_;  //!< Signal lock for update
 
   typedef union {
