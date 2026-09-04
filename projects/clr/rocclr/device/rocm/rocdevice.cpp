@@ -3402,12 +3402,14 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
     //    per pipe the pipe-collocation cost is identically zero and the ring term is the whole
     //    model. Above that a pipe holds more than one queue, the omitted term stops being zero,
     //    and the model is simply not defined -- so it DECLINES rather than extrapolating.
+    //  - The two conditions are spelled out here ONLY to count the decline separately; the
+    //    conjunction must stay identical to Device::PhiActive(), which is what every other site
+    //    asks. `eligible` is written from PhiActive() itself so the two cannot drift.
     const bool phi_live = settings().queue_phi_ != 0;
-    const bool phi_in_regime = settings().max_hw_queues_ <= numHwPipes_;
-    if (phi_live && !phi_in_regime) {
-      phi_stats_.declined_regime.fetch_add(1, std::memory_order_relaxed);
-    } else if (phi_live) {
+    if (PhiActive()) {
       phi_stats_.eligible.fetch_add(1, std::memory_order_relaxed);
+    } else if (phi_live) {
+      phi_stats_.declined_regime.fetch_add(1, std::memory_order_relaxed);
     }
     // Best-effort preferred queue hint: for graph stream stability
     // Skip preferred if it's in the excluded set

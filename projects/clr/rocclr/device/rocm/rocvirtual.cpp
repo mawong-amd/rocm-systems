@@ -847,7 +847,7 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
     // -- but it is a bias, not an absence of one, and it must be said out loud.
     // ⭐ The slot still describes its PREVIOUS use here -- it is reconfigured further down -- so
     // `phi_is_dispatch_` correctly identifies what the completed packet was.
-    if (gpu_.dev().settings().queue_phi_ != 0 && signal_list_[current_id_]->phi_is_dispatch_) {
+    if (gpu_.dev().PhiActive() && signal_list_[current_id_]->phi_is_dispatch_) {
       gpu_.PhiSampleDuration(signal_list_[current_id_]);
     }
 
@@ -1643,12 +1643,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // hipStreamSynchronize). So while the policy is live, force one. FULL FIDELITY on purpose:
   // sparse forcing was measured to degrade the policy, so sampling density is a shipping
   // optimisation to be fitted against a quality curve, not a design-time guess.
-  const bool phi_wants_signal = dev().settings().queue_phi_ != 0 &&
-                                dev().settings().max_hw_queues_ <= dev().NumHwPipes();
+  const bool phi_active = dev().PhiActive();
   const bool caller_wants_signal = timestamp_ != nullptr || attach_signal;
-  bool attachSignal = caller_wants_signal || phi_wants_signal;
+  bool attachSignal = caller_wants_signal || phi_active;
   // True when this packet carries a completion signal ONLY because the estimator asked for one.
-  const bool phi_only_signal = phi_wants_signal && !caller_wants_signal;
+  const bool phi_only_signal = phi_active && !caller_wants_signal;
   // Get active signal for current dispatch if profiling is necessary
   packet->completion_signal =
       Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal,
@@ -1726,7 +1725,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // Mark the flag indicating if a dispatch is outstanding.
   // We are not waiting after every dispatch.
   hasPendingDispatch_ = true;
-  phi_dispatches_.fetch_add(1, std::memory_order_relaxed);  // rho/d == the dispatch rate
+  // rho/d == the dispatch rate. ⛔ Gated: at PHI=0 this is a stock-path atomic RMW on every
+  // dispatch, bought for a counter nobody reads.
+  if (phi_active) {
+    phi_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // Wait on signal ?
   if (blocking) {
@@ -1877,16 +1880,29 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
     return false;
   }
 
+  static constexpr size_t kMetaPktSize =
+      sizeof(hsa_amd_metadata_kernel_dispatch_packet_t);
+  if (flatMetadataData != nullptr && !flatMetadataData->empty()) {
+    if (flatMetadataData->size() != numPackets * kMetaPktSize) {
+      return false;
+    }
+  }
+
   // ⭐⭐ COUNT THE GRAPH'S KERNEL DISPATCHES. Without this a saturating graph stream reads
   // `dispatches=0` while plain streams read their true count -- MEASURED: half the device's
   // dispatch load invisible to Phi, and with FORCE_GRAPH_QUEUES=4 at cap 4 *every* ring carries a
   // graph stream. `H_q` is the half of Phi that says a ring is loaded at all, and it is free here:
   // one pass over headers we already have.
+  // ⛔ MUST sit below EVERY early return in this function -- a batch that is rejected for a
+  // malformed metadata array never reaches the hardware, and counting it would inflate H_q for a
+  // stream that dispatched nothing. (This block used to precede the metadata check.)
   // ⛔ We deliberately do NOT force a completion signal on the batch tail to get `d`: it HANGS on
   // segmented graphs (reproducible), and even where it survives the tail is not one kernel
   // (3 samples reading 38333 ticks against a true ~5 us kernel). Graph streams therefore
-  // contribute to H_q and not to T_q until a per-kernel_object `d` cache lands.
-  if (dev().settings().queue_phi_ != 0) {
+  // contribute to H_q and not to T_q until the PROFILED-BATCH path lands -- see
+  // work/task313/HANDOFF-CAP4.md step 3; that route is different from the tail signal and is the
+  // one that has never been costed.
+  if (dev().PhiActive()) {
     uint64_t kernel_packets = 0;
     for (size_t i = 0; i < numPackets; ++i) {
       const uint16_t hdr = static_cast<uint16_t>(validFullHeaders[i]);
@@ -1900,14 +1916,6 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
       }
     }
     phi_dispatches_.fetch_add(kernel_packets, std::memory_order_relaxed);
-  }
-
-  static constexpr size_t kMetaPktSize =
-      sizeof(hsa_amd_metadata_kernel_dispatch_packet_t);
-  if (flatMetadataData != nullptr && !flatMetadataData->empty()) {
-    if (flatMetadataData->size() != numPackets * kMetaPktSize) {
-      return false;
-    }
   }
 
   std::scoped_lock lock(execution());

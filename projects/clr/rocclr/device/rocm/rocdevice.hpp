@@ -720,6 +720,18 @@ class Device : public NullDevice {
   //! Returns the number of hardware pipes
   uint32_t NumHwPipes() const { return numHwPipes_; }
 
+  //! ⭐ THE ONE PLACEMENT-POLICY GATE. Every Phi site must ask this and nothing else.
+  //! ⛔ It exists because the gate was previously spelled out at each site and the spellings
+  //! DIVERGED: signal forcing tested the regime, the `d` sampler tested only `queue_phi_ != 0`.
+  //! That asymmetry was inert only because no ordinary dispatch carries a caller-requested signal --
+  //! which is the very assumption forcing exists to work around, so the two would have disagreed
+  //! exactly where it mattered. One predicate, one place.
+  //! Regime: cap <= numHwPipes_ means at most one queue per pipe, so W(n) == 0 and only ring
+  //! sharing is priced. Outside it the policy declines (counted as `declined_regime`).
+  bool PhiActive() const {
+    return settings().queue_phi_ != 0 && settings().max_hw_queues_ <= numHwPipes_;
+  }
+
   //! Returns true if PM4 emulation is enabled
   bool IsPm4Emulation() const { return pm4_emulation_; }
 

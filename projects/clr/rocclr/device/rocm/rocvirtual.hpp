@@ -921,11 +921,16 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_ticks_{0};     //!< EWMA of packet duration, agent ticks
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
-  //! ⭐ `H_q = sum rho/d = c/W` is a RATE, and a monotonic count is not one. Without a time base a
-  //! stream that issued a million dispatches an hour ago and is now idle is indistinguishable from
-  //! a saturating one -- the same per-binding defect this campaign already retired once. The
-  //! selector computes `rate = phi_dispatches_ / (now - phi_epoch_ns_)`.
-  uint64_t phi_epoch_ns_ = 0;  //!< when counting for the current window began
+  //! ⛔⛔ OPEN, AND IT IS A REAL MODELLING HOLE, NOT AN OVERSIGHT: `H_q = sum rho/d = c/W` is a
+  //! RATE, and `phi_dispatches_` above is a MONOTONIC COUNT. Without a time base a stream that
+  //! issued a million dispatches an hour ago and is now idle is indistinguishable from a saturating
+  //! one -- which is exactly the per-binding defect this campaign already retired once
+  //! (idle bound streams counted at full weight => Phi spreads when it should merge).
+  //! ⛔ A `phi_epoch_ns_` field USED TO SIT HERE, declared and never written or read. It is deleted
+  //! rather than left in place, because a dead field that names the fix reads like the fix.
+  //! The window's reset policy (per-selector-consultation? decayed? fixed interval?) is a decision
+  //! that belongs to the selector, which is not written yet -- so this lands WITH the selector.
+  //! Tracked in work/task313/TODO.md. Until then H_q is a count and every claim must say so.
 
   Timestamp* timestamp_;
   bool sdma_profiling_for_cmd_ = false;  //!< SDMA profiling enabled for current command
