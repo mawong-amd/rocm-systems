@@ -225,9 +225,10 @@ Device::~Device() {
       amd::ScopedLock l(phi_streams_lock_);
       for (const auto& v : phi_streams_) {
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-                "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
+                "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu",
                 (unsigned long)v.dispatches, (unsigned long)v.d_ticks,
-                (unsigned long)v.samples, (unsigned long)v.rejected);
+                (unsigned long)v.samples, (unsigned long)v.rejected,
+                (unsigned long)v.skipped);
       }
     }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,

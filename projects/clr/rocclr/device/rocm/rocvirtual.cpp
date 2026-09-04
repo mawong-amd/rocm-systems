@@ -758,11 +758,12 @@ bool VirtualGPU::HwQueueTracker::Create() {
 // H carries 1/d), so a tick->ns conversion would buy nothing and could only introduce error.
 void VirtualGPU::PhiReport() const {
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu",
+          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
-          (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed));
+          (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed),
+          (unsigned long)phi_d_skipped_.load(std::memory_order_relaxed));
 }
 
 void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
@@ -847,8 +848,18 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
     // -- but it is a bias, not an absence of one, and it must be said out loud.
     // ⭐ The slot still describes its PREVIOUS use here -- it is reconfigured further down -- so
     // `phi_is_dispatch_` correctly identifies what the completed packet was.
-    if (gpu_.dev().PhiActive() && signal_list_[current_id_]->phi_is_dispatch_) {
-      gpu_.PhiSampleDuration(signal_list_[current_id_]);
+    // ⭐ POSITIVE CONTROL for the `is_dispatch` tag. `rejected` counts MALFORMED timings only
+    // (zero/inverted/absurd) and is ORTHOGONAL to this tag -- it cannot distinguish "no non-dispatch
+    // packets arrived" from "non-dispatch packets were folded in silently", so `rejected=0` is not
+    // evidence the tag works. `skipped` is: it counts recycled signals the tag DECLINED. A run with
+    // barriers or PM4 counter packets must read skipped > 0, and only a reading > 0 shows the tag
+    // discriminates at all rather than being permanently true.
+    if (gpu_.dev().PhiActive()) {
+      if (signal_list_[current_id_]->phi_is_dispatch_) {
+        gpu_.PhiSampleDuration(signal_list_[current_id_]);
+      } else {
+        gpu_.PhiCountSkipped();
+      }
     }
 
     // Have to wait the next signal in the queue to avoid a race condition between
@@ -1623,7 +1634,7 @@ void VirtualGPU::CompleteAqlSubmission(const AqlSlotReservation& reservation) {
 // ================================================================================================
 template <typename AqlPacket>
 bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, uint16_t rest,
-                                          bool blocking, bool attach_signal) {
+                                          bool blocking, bool attach_signal, bool is_dispatch) {
   const uint32_t queueSize = gpu_queue_->size;
   const uint32_t queueMask = queueSize - 1;
   const uint32_t sw_queue_size = queueMask;
@@ -1651,7 +1662,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
   // Get active signal for current dispatch if profiling is necessary
   packet->completion_signal =
       Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal,
-                              /*is_dispatch=*/true, /*phi_only=*/phi_only_signal);
+                              /*is_dispatch=*/is_dispatch, /*phi_only=*/phi_only_signal);
 
   if (timestamp_ != nullptr) {
     // If profiling is enabled, store the correlation ID in the dispatch packet. The profiler
@@ -1824,7 +1835,11 @@ bool VirtualGPU::dispatchAqlPacket(AqlPacket* packet, uint16_t header,
     return true;
   } else {
     dispatchBlockingWait(reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packet));
-    return dispatchGenericAqlPacket(packet, header, rest, blocking, attach_signal);
+    // ⭐ The ONLY caller that is genuinely a kernel dispatch. `dispatchCounterAqlPacket` takes the
+    // fail-closed default; see the declaration for why this is a caller's assertion and not
+    // re-derived from the header here.
+    return dispatchGenericAqlPacket(packet, header, rest, blocking, attach_signal,
+                                    /*is_dispatch=*/true);
   }
 }
 // ================================================================================================
@@ -2319,6 +2334,8 @@ bool VirtualGPU::dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet,
     case PerfCounter::ROC_GFX9:
     case PerfCounter::ROC_GFX10: {
       uint16_t hdr = HSA_PACKET_TYPE_VENDOR_SPECIFIC << HSA_PACKET_HEADER_TYPE;
+      // ⛔ is_dispatch stays FALSE (the default): this is a PM4 perf-counter IB, not a kernel
+      // dispatch. Its duration must never reach the `d` estimator.
       return dispatchGenericAqlPacket(packet, hdr, 0, blocking);
     } break;
   }
@@ -2623,7 +2640,8 @@ VirtualGPU::~VirtualGPU() {
     dev().PhiRecordStream(phi_dispatches_.load(std::memory_order_relaxed),
                           phi_d_ticks_.load(std::memory_order_relaxed),
                           phi_d_samples_.load(std::memory_order_relaxed),
-                          phi_d_rejected_.load(std::memory_order_relaxed));
+                          phi_d_rejected_.load(std::memory_order_relaxed),
+                          phi_d_skipped_.load(std::memory_order_relaxed));
   }
 
 

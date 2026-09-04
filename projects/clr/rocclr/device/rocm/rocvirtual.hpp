@@ -753,9 +753,18 @@ class VirtualGPU : public device::VirtualDevice {
                                   bool blocking = false,
                                   const std::vector<uint8_t>* flatMetadataData = nullptr) override;
 
+  //! ⛔⛔ `is_dispatch` DEFAULTS FALSE ON PURPOSE -- IT MUST FAIL CLOSED. This function serves BOTH
+  //! the kernel-dispatch path and `dispatchCounterAqlPacket`, which pushes a PM4 perf-counter IB
+  //! through it as a VENDOR_SPECIFIC packet. Tagging that as a dispatch folds a perf-counter
+  //! packet's duration into the `d` estimate -- the barrier-mixture bug this flag exists to
+  //! prevent. A wrong `false` loses a sample; a wrong `true` corrupts an EWMA for ~250 samples.
+  //! ⛔ Do NOT re-derive this from `header`/`rest` here: the batch path packs setup in the HIGH
+  //! half of a full_header dword while this path takes `setup` from `rest >> 8`. The two
+  //! conventions differ, and guessing between them is how this bug got here.
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
-                                                              bool attach_signal = false);
+                                                              bool attach_signal = false,
+                                                              bool is_dispatch = false);
 
   bool dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet, const uint32_t gfxVersion,
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
@@ -912,6 +921,8 @@ class VirtualGPU : public device::VirtualDevice {
   //! const + mutable: the tracker holds `gpu_` by const reference, and this is
   //! accounting/estimator state rather than observable queue state.
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
+  //! Count a recycled signal the `is_dispatch` tag DECLINED -- the positive control for that tag.
+  void PhiCountSkipped() const { phi_d_skipped_.fetch_add(1, std::memory_order_relaxed); }
 
   //! ⛔ ATOMIC because slice C will read ANOTHER stream's counters from
   //! Device::getQueueFromPool, which runs under `active_queue_access_` -- a DIFFERENT monitor from
@@ -921,6 +932,7 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_ticks_{0};     //!< EWMA of packet duration, agent ticks
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
+  mutable std::atomic<uint64_t> phi_d_skipped_{0};   //!< recycles declined by the is_dispatch tag
   //! ⛔⛔ OPEN, AND IT IS A REAL MODELLING HOLE, NOT AN OVERSIGHT: `H_q = sum rho/d = c/W` is a
   //! RATE, and `phi_dispatches_` above is a MONOTONIC COUNT. Without a time base a stream that
   //! issued a million dispatches an hour ago and is now idle is indistinguishable from a saturating
