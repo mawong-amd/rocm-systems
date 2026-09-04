@@ -758,12 +758,13 @@ bool VirtualGPU::HwQueueTracker::Create() {
 // H carries 1/d), so a tick->ns conversion would buy nothing and could only introduce error.
 void VirtualGPU::PhiReport() const {
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu",
+          "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu win_ticks=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_rejected_.load(std::memory_order_relaxed),
-          (unsigned long)phi_d_skipped_.load(std::memory_order_relaxed));
+          (unsigned long)phi_d_skipped_.load(std::memory_order_relaxed),
+          (unsigned long)PhiWindowTicks());
 }
 
 void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
@@ -794,6 +795,12 @@ void VirtualGPU::PhiSampleDuration(ProfilingSignal* sig) const {
   const uint64_t n = phi_d_samples_.load(std::memory_order_relaxed);
   phi_d_ticks_.store((n == 0) ? dur : (prev * 7 + dur) / 8, std::memory_order_relaxed);
   phi_d_samples_.fetch_add(1, std::memory_order_relaxed);
+  // ⭐ The time base for H_q, free: `end` is already in hand and was being discarded. Same tick
+  // domain as `d`, so no conversion. First sample seeds both ends; later ones extend the window.
+  if (n == 0) {
+    phi_d_window_first_.store(end, std::memory_order_relaxed);
+  }
+  phi_d_window_last_.store(end, std::memory_order_relaxed);
 }
 
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_val, Timestamp* ts,
@@ -2641,7 +2648,8 @@ VirtualGPU::~VirtualGPU() {
                           phi_d_ticks_.load(std::memory_order_relaxed),
                           phi_d_samples_.load(std::memory_order_relaxed),
                           phi_d_rejected_.load(std::memory_order_relaxed),
-                          phi_d_skipped_.load(std::memory_order_relaxed));
+                          phi_d_skipped_.load(std::memory_order_relaxed),
+                          PhiWindowTicks());
   }
 
 

@@ -916,8 +916,10 @@ class VirtualGPU : public device::VirtualDevice {
   //! DIMENSIONLESS -- T carries units of d, H carries 1/d -- so `d` is kept in RAW AGENT TICKS and
   //! never translated. Deliberate: every tick<->ns conversion is somewhere to put a units bug and
   //! the model does not need one.
-  //! ⭐ rho/d is EXACTLY the dispatch rate (rho = c*d/W, so rho/d = c/W), which means H_q needs
-  //! only `phi_dispatches_` -- a counter, no timestamps, no sampling, no bias. Only T_q needs `d`.
+  //! ⭐ rho/d is EXACTLY the dispatch rate (rho = c*d/W, so rho/d = c/W), so H_q needs no `d`.
+  //! ⛔ BUT A RATE IS NOT A COUNT: it needs `phi_dispatches_` AND a time base. This comment used to
+  //! claim H_q needed "only `phi_dispatches_` -- a counter, no timestamps"; that was WRONG and
+  //! contradicted the note on the window below. See `phi_d_window_*` for the base and what it costs.
   //! const + mutable: the tracker holds `gpu_` by const reference, and this is
   //! accounting/estimator state rather than observable queue state.
   void PhiSampleDuration(ProfilingSignal* sig) const;  //!< fold one completed packet into `d`
@@ -933,16 +935,37 @@ class VirtualGPU : public device::VirtualDevice {
   mutable std::atomic<uint64_t> phi_d_samples_{0};   //!< samples folded in
   mutable std::atomic<uint64_t> phi_d_rejected_{0};  //!< timings rejected as unusable
   mutable std::atomic<uint64_t> phi_d_skipped_{0};   //!< recycles declined by the is_dispatch tag
-  //! ⛔⛔ OPEN, AND IT IS A REAL MODELLING HOLE, NOT AN OVERSIGHT: `H_q = sum rho/d = c/W` is a
-  //! RATE, and `phi_dispatches_` above is a MONOTONIC COUNT. Without a time base a stream that
-  //! issued a million dispatches an hour ago and is now idle is indistinguishable from a saturating
-  //! one -- which is exactly the per-binding defect this campaign already retired once
-  //! (idle bound streams counted at full weight => Phi spreads when it should merge).
-  //! ⛔ A `phi_epoch_ns_` field USED TO SIT HERE, declared and never written or read. It is deleted
-  //! rather than left in place, because a dead field that names the fix reads like the fix.
-  //! The window's reset policy (per-selector-consultation? decayed? fixed interval?) is a decision
-  //! that belongs to the selector, which is not written yet -- so this lands WITH the selector.
-  //! Tracked in work/task313/TODO.md. Until then H_q is a count and every claim must say so.
+  //! ⭐⭐ THE TIME BASE FOR `H_q`, AND IT IS FREE. `H_q = sum rho/d = c/W` is a RATE, and
+  //! `phi_dispatches_` above is a MONOTONIC COUNT. Without a base a stream that issued a million
+  //! dispatches an hour ago and is now idle is indistinguishable from a saturating one -- the same
+  //! per-binding defect this campaign already retired once (idle bound streams counted at full
+  //! weight => Phi spreads when it should merge).
+  //! ⭐ These cost NOTHING: `PhiSampleDuration` already reads `end` from the completed signal and
+  //! throws it away. Recording first/last turns it into a window. Same tick domain as `d`, so no
+  //! conversion and no units bug. `rate ~= (samples - 1) / (last_end - first_end)`.
+  //! ⭐⭐ AND IT NEEDS NO RESET POLICY -- which was the whole objection that got `phi_epoch_ns_`
+  //! (a declared-but-never-written field) deleted rather than wired. A window with explicit
+  //! endpoints is self-describing; an epoch is only meaningful relative to a reset convention the
+  //! selector had not chosen yet.
+  //! ⛔ WHY IT MATTERS EVEN THOUGH OUR PROBES CANNOT SEE IT: under a COMMON window the missing base
+  //! cancels EXACTLY out of a ring-vs-ring comparison (verified offline: 3,000 randomised trials,
+  //! every apparent flip at relative gap <= 6e-14, i.e. roundoff). Under PER-STREAM windows 25.8%
+  //! of argmins flip. Every stream in our probes starts and stops together, so this defect is
+  //! STRUCTURALLY INVISIBLE in all of our data and live in production, where streams do not.
+  //! ⛔ Consumer not yet written: the selector must use these, not `phi_dispatches_` alone.
+  mutable std::atomic<uint64_t> phi_d_window_first_{0};  //!< `end` of the first sample, ticks
+  mutable std::atomic<uint64_t> phi_d_window_last_{0};   //!< `end` of the most recent sample, ticks
+
+ public:
+  //! Span of the observation window in agent ticks; 0 when fewer than two samples exist, which the
+  //! caller MUST treat as "rate unknown" rather than dividing by it.
+  uint64_t PhiWindowTicks() const {
+    const uint64_t f = phi_d_window_first_.load(std::memory_order_relaxed);
+    const uint64_t l = phi_d_window_last_.load(std::memory_order_relaxed);
+    return (l > f) ? (l - f) : 0;
+  }
+
+ private:
 
   Timestamp* timestamp_;
   bool sdma_profiling_for_cmd_ = false;  //!< SDMA profiling enabled for current command
