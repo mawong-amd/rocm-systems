@@ -1036,6 +1036,18 @@ class Device : public NullDevice {
     //! reader padding. Renamed rather than added, so `PhiSelQRec` stays 48 B and every existing
     //! reader is unaffected.
     uint8_t n_clamp, n_nod, n_norate;
+    //! ⛔ v4. 1 = this ring was in the pool but EXCLUDED from the ranking by the caller's
+    //! `excluded_ids` (a graph sibling already holds it). Its aggregates below are still filled, so
+    //! a counterfactual over a WIDER candidate set is computable offline; before v4 excluded rings
+    //! were not emitted at all and those inputs were simply absent.
+    //! ⭐ A scorer reproduces v3's numbers EXACTLY by dropping records with `excluded != 0`.
+    //! `PhiSelRec::cands` still counts rankable entries only.
+    uint8_t excluded;
+    //! ⛔ EXPLICIT, NEVER IMPLICIT. v1 left three bytes of compiler padding here; v2 spent them on
+    //! counters, so a v2-layout reader parsed v1 padding at exactly the right offsets and reported
+    //! a confident zero. MEASURED: 6563/6563 v1 records read (0,0,0). Name the padding so the next
+    //! field to be added cannot repeat it.
+    uint8_t pad_[3];
     float Tw, Hw, Tu, Hu;
   };
   //! ⭐ PER-STREAM SNAPSHOT. The ring aggregates above cannot answer "what is the duty

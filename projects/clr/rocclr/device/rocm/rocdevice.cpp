@@ -3478,7 +3478,12 @@ bool Device::PhiTraceMapOpen() const {
   // preserved DSV4 data: 6563 of 6563 records read (0,0,0). Reporting that as `n_imput = 0` is a
   // check that cannot fail -- and an earlier commit message of ours cited exactly that as a
   // measurement. A reader must REFUSE to report these counters for version 1, not print 0.
-  phi_hdr_->version = 3;
+  // ⛔ VERSION 4: `PhiSelQRec` grew a `uint8_t excluded` (48 B -> 56 B) and every pool entry is now
+  // emitted, not just the rankable ones. Unlike the v2->v3 bump this one DOES move offsets, so a v3
+  // reader fails loudly rather than quietly -- but dispatch on the version anyway.
+  // ⭐ `PhiSelRec::cands` still counts RANKABLE candidates only, and excluded records are flagged,
+  // so filtering on the flag reproduces v3's numbers exactly.
+  phi_hdr_->version = 4;
   phi_hdr_->sel_cap = kPhiTraceSel;
   phi_hdr_->selq_cap = kPhiTraceSelQ;
   phi_hdr_->sel_n = 0;
@@ -3643,6 +3648,9 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     const hsa_queue_t* q;
     uint32_t rc;     //!< stock's refCount at THIS instant (read before the increment)
     uint8_t ded;     //!< stock's hasDedicatedQueue_ (its 2048 metric penalty; Phi has no analogue)
+    //! ⛔ Recorded but NOT ranked. Kept out of the argmin, out of `n_free`/`n_meas`/`mult_*` and out
+    //! of `PhiSelRec::cands`, so every published statistic keeps its pre-existing meaning.
+    uint8_t excluded;
     uint32_t n;      //!< streams the shadow census can see bound here
     uint32_t n_unk;  //!< ... of which contributed nothing measurable
     //! ⭐ The paths by which `d` reaches the bind-time decision. Everywhere else it cancels:
@@ -3655,16 +3663,28 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   std::vector<Cand> cands;
   cands.reserve(queuePool_[qIndex].size());
 
+  // ⛔⛔ EVERY POOL ENTRY IS RECORDED, INCLUDING EXCLUDED ONES. This used to `continue` on
+  // exclusion "to keep the comparison like-for-like" with stock, which is right for SCORING but
+  // wrong for the TRACE: the excluded rings' `n`/`n_unk`/`Tw`/`Hw`/`Tu`/`Hu` were never written, so
+  // a counterfactual over a WIDER candidate set was not computable offline -- its inputs were
+  // absent, not merely unlabelled, and no amount of re-scoring could recover them.
+  // ⭐ Like-for-like scoring is PRESERVED exactly: excluded entries are flagged, kept out of the
+  // ranking and out of every published statistic, and a scorer reproduces today's numbers by
+  // filtering on the flag. What changes is only that the counterfactual is now RECOVERABLE.
+  // ⚠️ Cost is one extra record per excluded ring per decision -- MEASURED in production, exclusion
+  // applies to 0.9% of decisions and never removes more than 2 of 4 rings, so this is noise. Size
+  // was never the constraint; instrument TIME is, and this adds no work to the ranking.
+  uint32_t n_rank = 0;
   for (const auto& entry : queuePool_[qIndex]) {
     const hsa_queue_t* q = entry.first;
-    if (excluded_ids != nullptr && excluded_ids->count(q->id) > 0) {
-      continue;  // stock would not pick it either; keep the comparison like-for-like
-    }
+    const uint8_t excl =
+        (excluded_ids != nullptr && excluded_ids->count(q->id) > 0) ? 1 : 0;
+    if (excl == 0) ++n_rank;
     cands.push_back(Cand{q, static_cast<uint32_t>(entry.second.refCount),
                          static_cast<uint8_t>(entry.second.hasDedicatedQueue_ ? 1 : 0),
-                         0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0});
+                         excl, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0});
   }
-  if (!cands.empty()) {
+  if (n_rank != 0) {
     // ⛔ Read the device's fixed slot array, NEVER `vgpus()` -- that vector is resized/erased under
     // a different monitor than the one held here. See Device::PhiPublishStream.
     // ⛔ ONE pass over the slots, not one per candidate. The per-candidate form did
@@ -3687,8 +3707,9 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
         }
       }
       if (cp == nullptr) {
-        continue;  // bound to a queue that is not a candidate here (excluded, other priority,
-                   // or a cu-masked/cooperative queue, which never enters queuePool_ at all)
+        continue;  // bound to a queue that is not in this pool at all (other priority, or a
+                   // cu-masked/cooperative queue, which never enters queuePool_).
+                   // ⭐ Excluded rings ARE candidates now and DO get their stats filled.
       }
       Cand& c = *cp;
       ++c.n;
@@ -3786,7 +3807,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
       c.Hu += 1.0 / dd_f;
     }
   }
-  if (cands.empty()) {
+  if (n_rank == 0) {
     // ⛔ CENSUS HOLE otherwise. Stock still returned a queue here (its comparator prefers
     // non-excluded and falls back, logging "(excluded-fallback)"), so returning silently makes
     // #T313SEL != #decisions with nothing to indicate it. Rare, but an undercount that looks like a
@@ -3873,9 +3894,15 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     const MetricKey ka = key(a, weighted), kb = key(b, weighted);
     return ka.occ == kb.occ && ka.blind == kb.blind && ka.H == kb.H;
   };
+  // ⛔ `best_*` MUST START ON A RANKABLE ENTRY. Initialising to index 0 was safe when the vector
+  // held only rankable candidates; now that excluded rings are recorded too, index 0 may be one of
+  // them and every `better()` comparison would be against a ring stock could not pick.
   size_t best_w = 0, best_u = 0;
+  while (best_w < cands.size() && cands[best_w].excluded) ++best_w;
+  best_u = best_w;
   uint32_t n_free = 0, n_meas = 0;
   for (size_t i = 0; i < cands.size(); ++i) {
+    if (cands[i].excluded) continue;   // recorded for the counterfactual; never ranked
     if (better(cands[i], cands[best_w], true)) best_w = i;
     if (better(cands[i], cands[best_u], false)) best_u = i;
     if (cands[i].rc == 0) ++n_free;
@@ -3893,11 +3920,13 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   // scoring the tie-break.
   uint32_t mult_w = 0, mult_u = 0;
   for (const auto& c : cands) {
+    if (c.excluded) continue;          // ⛔ or a recorded-but-unrankable ring inflates the tie set
     if (tied(c, cands[best_w], true)) ++mult_w;
     if (tied(c, cands[best_u], false)) ++mult_u;
   }
-  const bool eval_w = mult_w < cands.size();
-  const bool eval_u = mult_u < cands.size();
+  // ⛔ Against `n_rank`, NOT `cands.size()`: "everything ties" means every RANKABLE candidate ties.
+  const bool eval_w = mult_w < n_rank;
+  const bool eval_u = mult_u < n_rank;
   const uint64_t stock_id = (stock_choice != nullptr) ? stock_choice->id : 0;
   // ⭐ Append only. No formatting, no I/O, no lock, NO ALLOCATION -- see the note on the ring in
   // the header and the eager reserve in Device::create.
@@ -3921,7 +3950,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   r.stock = stock_id;
   r.phi_w = eval_w ? cands[best_w].q->id : 0;
   r.phi_u = eval_u ? cands[best_u].q->id : 0;
-  r.cands = static_cast<uint32_t>(cands.size());
+  r.cands = n_rank;  // ⛔ rankable only -- unchanged meaning, so v3 and v4 stay comparable
   r.n_free = n_free;
   r.n_meas = n_meas;
   r.eval_w = eval_w ? 1 : 0;
@@ -3945,6 +3974,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     qr.n_norate = static_cast<uint8_t>(c.n_norate > 255 ? 255 : c.n_norate);
     qr.rc = c.rc;
     qr.ded = c.ded;
+    qr.excluded = c.excluded;
     qr.Tw = static_cast<float>(c.Tw);
     qr.Hw = static_cast<float>(c.Hw);
     qr.Tu = static_cast<float>(c.Tu);
