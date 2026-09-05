@@ -3431,11 +3431,24 @@ bool Device::PhiTraceMapOpen() const {
   }
   const size_t len = sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec) +
                      kPhiTraceSelQ * sizeof(PhiSelQRec) + kPhiTraceSlot * sizeof(PhiSlotRec);
-  // ⭐ pid AND device index in the name. Eight TP ranks are eight PROCESSES with eight independent
+  // ⭐ pid AND a device slot in the name. Eight TP ranks are eight PROCESSES with eight independent
   // `seq` counters; pooling them is a scorer bug that separate files make impossible.
+  //
+  // ⛔⛔ THIS MUST NOT USE `index()`. `index_` is incremented by amd::Device::registerDevice()
+  // (device.cpp), which runs at rocdevice.cpp:552 -- strictly AFTER Device::create() at :622, which
+  // is what calls us. So `index()` is 0 for EVERY device here, and in a multi-GPU process every
+  // device would open, O_TRUNC and MAP_SHARED the SAME `t313trace.<pid>.0.bin`: concurrent writers
+  // on one mapping, with two `seq` sequences interleaved and each truncating the other's header.
+  // ⚠️ It is MASKED today -- under TP8 each rank sees one device, and our probes pin
+  // `ROCR_VISIBLE_DEVICES`. It fires on the first unpinned multi-GPU run.
+  // ⛔ And the scorer's `dev == filename[2]` guard CANNOT catch it: both sides read 0.
+  // A process-local counter is used instead. It is not the logical device index and does not claim
+  // to be -- it exists only to keep the files distinct; the agent handle below identifies the GPU.
+  static std::atomic<uint32_t> phi_trace_slot{0};
+  const uint32_t dev_slot = phi_trace_slot.fetch_add(1, std::memory_order_relaxed);
   char path[1024];
   snprintf(path, sizeof(path), "%s/t313trace.%d.%u.bin", dir, static_cast<int>(getpid()),
-           static_cast<unsigned>(index()));
+           static_cast<unsigned>(dev_slot));
   const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
     return false;
@@ -3471,16 +3484,29 @@ bool Device::PhiTraceMapOpen() const {
   phi_hdr_->sel_n = 0;
   phi_hdr_->selq_n = 0;
   phi_hdr_->pid = static_cast<uint64_t>(getpid());
-  phi_hdr_->dev = index();
+  // ⛔ Same reason as the filename: `index()` is 0 here for every device. Must MATCH the name, or
+  // the scorer's `dev == filename[2]` cross-check compares two different things and passes anyway.
+  phi_hdr_->dev = dev_slot;
   phi_hdr_->slot_cap = kPhiTraceSlot;
   phi_hdr_->slot_n = 0;
+  // ⛔ `0` MEANS OFF AND MUST BE ACCEPTED. The old guard was `if (v > 0)`, so `DEBUG_CLR_PHI_SNAP=0`
+  // was silently REJECTED and fell through to the 1000-decision default -- i.e. the one value a
+  // user would reach for to disable snapshots was the one value that could not disable them, with
+  // no diagnostic. Snapshots are the only new work done inside `active_queue_access_`, so being
+  // unable to switch them off is exactly the knob you want when costing the lock.
   { const char* sv = getenv("DEBUG_CLR_PHI_SNAP");
     if (sv != nullptr && sv[0] != '\0') {
-      const long v = strtol(sv, nullptr, 10);
-      if (v > 0) phi_snap_every_ = static_cast<uint64_t>(v);
+      char* end = nullptr;
+      const long v = strtol(sv, &end, 10);
+      // Reject only garbage and negatives; `0` is a legal request to disable.
+      if (end != sv && *end == '\0' && v >= 0) phi_snap_every_ = static_cast<uint64_t>(v);
     } }
   phi_hdr_->snap_every = phi_snap_every_;
-  phi_hdr_->reserved_ = 0;
+  // ⭐ `dev_slot` above is only an anti-collision counter, so record WHICH GPU this is. The HSA
+  // agent handle is available at create() time (unlike `index()`) and is stable within the process.
+  // ⚠️ v3 files written before this line carry 0 here; 0 is not a valid agent handle, so a reader
+  // can tell "unset" from a real value without another version bump.
+  phi_hdr_->reserved_ = static_cast<uint64_t>(bkendDevice_.handle);
   phi_sel_buf_ = reinterpret_cast<PhiSelRec*>(static_cast<char*>(m) + sizeof(PhiTraceHdr));
   phi_selq_buf_ = reinterpret_cast<PhiSelQRec*>(
       static_cast<char*>(m) + sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec));
@@ -3883,7 +3909,9 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     return;
   }
   const uint64_t si = phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed);
-  if (phi_slot_buf_ != nullptr && (si % phi_snap_every_) == 0) {
+  // ⛔ `phi_snap_every_ == 0` means OFF. Test it BEFORE the modulo -- `si % 0` is UB, and with the
+  // off-switch now reachable this is no longer a hypothetical divisor.
+  if (phi_slot_buf_ != nullptr && phi_snap_every_ != 0 && (si % phi_snap_every_) == 0) {
     PhiTraceSnapshot(t_ref);
   }
   if (phi_hdr_ != nullptr) phi_hdr_->sel_n = si + 1;  // published as we go, not at teardown
