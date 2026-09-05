@@ -232,13 +232,13 @@ Device::~Device() {
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
                 "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
                 "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu "
-                "shape_live=%lu shape_open=%lu",
+                "shape_live=%lu shape_open=%lu migrate_declined=%lu",
                 (unsigned long)v.dispatches, (unsigned long)v.d_ticks,
                 (unsigned long)v.samples, (unsigned long)v.rejected,
                 (unsigned long)v.skipped, (unsigned long)v.win, (unsigned long)v.rate_disp,
                 (unsigned long)v.rate_ticks, (unsigned long)v.sweep_max,
                 (unsigned long)v.shape_ovf, (unsigned long)v.shape_live,
-                (unsigned long)v.shape_open);
+                (unsigned long)v.shape_open, (unsigned long)v.migrate_declined);
       }
     }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
@@ -720,6 +720,22 @@ bool Device::create() {
     LogPrintfError("Unable to create settings for HSA device %s (PCI ID %x)", agent_name,
                    pciDeviceId_);
     return false;
+  }
+
+  // ⛔⛔ SAY SO AT INIT WHEN THE REGIME DECLINES. `PhiActive()` is false whenever
+  // `max_hw_queues_ > numHwPipes_`, so `DEBUG_CLR_QUEUE_PHI=4` at, say, GPU_MAX_HW_QUEUES=8
+  // behaves EXACTLY like PHI=0: the three PhiUnbypassed() behaviour changes all revert and no trace is
+  // written. Until now the only evidence was `declined_regime` in the `T313PHI` line at TEARDOWN,
+  // at LOG_INFO on LOG_QUEUE -- i.e. a live mode that silently degrades to the baseline, which is
+  // verbatim the failure the bitfield widening was done to prevent. One line, at init, at WARNING.
+  // ⚠️ Deliberately reports the requested mode AND both regime operands, so the message is
+  // actionable without re-deriving the predicate.
+  if (settings().queue_phi_ != 0 && !PhiActive()) {
+    ClPrint(amd::LOG_WARNING, amd::LOG_INIT,
+            "DEBUG_CLR_QUEUE_PHI=%u is INACTIVE on this device: the policy is defined only for "
+            "cap <= pipes and GPU_MAX_HW_QUEUES=%u > numHwPipes=%u. Behaviour is identical to "
+            "DEBUG_CLR_QUEUE_PHI=0; no shadow trace will be written.",
+            settings().queue_phi_, settings().max_hw_queues_, numHwPipes_);
   }
 
   // ⛔ ALLOCATE THE SHADOW TRACE HERE, NOT LAZILY ON THE DECISION PATH. The lazy `resize()` ran on
@@ -3489,13 +3505,19 @@ bool Device::PhiTraceMapOpen() const {
   phi_hdr_->sel_n = 0;
   phi_hdr_->selq_n = 0;
   phi_hdr_->pid = static_cast<uint64_t>(getpid());
-  // ⛔ Same reason as the filename: `index()` is 0 here for every device. Must MATCH the name, or
-  // the scorer's `dev == filename[2]` cross-check compares two different things and passes anyway.
+  // ⛔ Same reason as the filename: `index()` is 0 here for every device.
+  // ⛔⛔ AND BE HONEST ABOUT WHAT THIS BUYS: the scorer's `dev == filename[2]` cross-check is now
+  // TAUTOLOGICAL. Both sides are written from `dev_slot`, two statements apart, so the check
+  // cannot fail -- it could not fail before either (both read 0). Making the two agree fixed the
+  // FILE COLLISION; it did not make the cross-check meaningful. The only non-tautological identity
+  // in this header is `reserved_` (the HSA agent handle) below, and no reader checks it yet.
+  // ⇒ A scorer that wants a real per-GPU cross-check must compare `reserved_` across files.
   phi_hdr_->dev = dev_slot;
   phi_hdr_->slot_cap = kPhiTraceSlot;
   phi_hdr_->slot_n = 0;
   // ⛔ `0` MEANS OFF AND MUST BE ACCEPTED. The old guard was `if (v > 0)`, so `DEBUG_CLR_PHI_SNAP=0`
-  // was silently REJECTED and fell through to the 1000-decision default -- i.e. the one value a
+  // was silently REJECTED and fell through to `kPhiSnapEveryDefault` (100, not the "1000" this
+  // comment used to claim -- open the header, do not recall the constant) -- i.e. the one value a
   // user would reach for to disable snapshots was the one value that could not disable them, with
   // no diagnostic. Snapshots are the only new work done inside `active_queue_access_`, so being
   // unable to switch them off is exactly the knob you want when costing the lock.
@@ -3975,6 +3997,13 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     qr.rc = c.rc;
     qr.ded = c.ded;
     qr.excluded = c.excluded;
+    // ⛔ ZERO THE NAMED PADDING. These bytes are never read today, which is precisely why they are
+    // dangerous: the ring WRAPS in place over a MAP_SHARED file, so an unwritten field carries the
+    // previous occupant's bytes rather than zero. Naming the padding (v4) removed half the trap;
+    // writing it removes the other half, so the first reader to promote `pad_` to a counter cannot
+    // repeat the v1/v2 failure of parsing stale bytes at exactly the right offset and reporting a
+    // confident value. Three stores per record, off any lock-sensitive path.
+    qr.pad_[0] = qr.pad_[1] = qr.pad_[2] = 0;
     qr.Tw = static_cast<float>(c.Tw);
     qr.Hw = static_cast<float>(c.Hw);
     qr.Tu = static_cast<float>(c.Tu);
@@ -4018,14 +4047,14 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
     // not physics -- its justification is PR #5031's stream stability across launches, which is a
     // performance preference the policy can price: preferring the incumbent ring IS a migration-cost
     // term, and `C_migrate` is currently 0 by explicit decision.
-    // ⛔ Under `PhiLive()` we do NOT take the bypass. The hinted queue is still in `queuePool_`, so
+    // ⛔ Under `PhiUnbypassed()` we do NOT take the bypass. The hinted queue is still in `queuePool_`, so
     // it remains a candidate and WINS whenever the metric agrees -- which per #5031's own claim is
     // most of the time. Stability is preserved on the merits instead of by fiat.
     // ⚠️ MEASURED, and it is why this is worth doing at all: the bypass is 45% of graph
     // re-acquisitions in the toy probes but **0 of ~1,300 in-workload production decisions** in all
     // three v3 arms (0.9% whole-lifetime, a startup phenomenon). So expect this to change little in
     // DSV4 and a great deal in the probes -- do not read a probe delta as a production result.
-    if (preferred != nullptr && !PhiLive()) {
+    if (preferred != nullptr && !PhiUnbypassed()) {
       bool preferred_excluded = excluded_ids && excluded_ids->count(preferred->id) > 0;
       if (!preferred_excluded) {
         auto it = queuePool_[qIndex].find(preferred);

@@ -39,15 +39,18 @@ class Settings : public device::Settings {
       uint queue_pipe_dist_ : 1;       //!< gfx94x queue pipe distribution
       uint ext_dispatch_packet_ : 1;   //!< Uses new ext dispatch packet for all launches
       uint aql_barrier_opt_ : 1;       //!< Per-stream barrier-bit optimization
-      //! Total-slowdown placement policy: 0 off, 1 observe only, 2 select.
-      //! ⛔ 2 BITS, and DEBUG_CLR_QUEUE_PHI is a uint -- it MUST be clamped where it is
-      //! assigned. dynamic_queues_ has the same width and is NOT clamped, so
-      //! DEBUG_HIP_DYNAMIC_QUEUES=4 silently reads as 0 (off) with no diagnostic. Do not
-      //! reproduce that here: a mode that silently degrades to a stock baseline is
-      //! indistinguishable from a working control.
-      //! ⛔ WIDENED 2 -> 3 BITS for the live mode. At 2 bits `DEBUG_CLR_QUEUE_PHI=4` would have
-      //! stored as 0, i.e. silently STOCK -- exactly the failure the note above describes for
-      //! `dynamic_queues_`. The clamp in rocsettings.cpp must stay <= (1 << width) - 1.
+      //! ⭐ Total-slowdown placement policy. THE LADDER IS DEFINED IN EXACTLY ONE PLACE --
+      //! `Device::PhiActive/PhiShadow/PhiTimed/PhiUnbypassed` in rocdevice.hpp. Do NOT restate it here or
+      //! in rocsettings.cpp: it has already drifted into THREE spellings (this one said
+      //! "0 off, 1 observe only, 2 select"; rocsettings.cpp said "3 live"; the predicates said
+      //! otherwise), which is the same "two printers, one format string" failure that has bitten
+      //! this file before. One definition, referenced.
+      //! ⛔ 3 BITS (widened from 2 for mode 4), and DEBUG_CLR_QUEUE_PHI is a uint -- it MUST be
+      //! clamped where it is assigned, and the clamp must stay <= (1 << width) - 1 == 7.
+      //! At 2 bits `DEBUG_CLR_QUEUE_PHI=4` stored as 0, i.e. silently STOCK. dynamic_queues_ has
+      //! the OLD width and is still NOT clamped, so DEBUG_HIP_DYNAMIC_QUEUES=4 silently reads as 0
+      //! (off) with no diagnostic. Do not reproduce that here: a mode that silently degrades to a
+      //! stock baseline is indistinguishable from a working control.
       uint queue_phi_ : 3;
       uint reserved_ : 14;
     };

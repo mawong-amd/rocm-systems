@@ -769,7 +769,7 @@ void VirtualGPU::PhiReport() const {
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
           "T313PHIVG dispatches=%lu d_ticks=%lu samples=%lu rejected=%lu skipped=%lu "
           "win_ticks=%lu rate_disp=%lu rate_ticks=%lu sweep_max=%lu shape_ovf=%lu "
-          "shape_live=%lu shape_open=%lu",
+          "shape_live=%lu shape_open=%lu migrate_declined=%lu",
           (unsigned long)phi_dispatches_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_ticks_.load(std::memory_order_relaxed),
           (unsigned long)phi_d_samples_.load(std::memory_order_relaxed),
@@ -778,7 +778,13 @@ void VirtualGPU::PhiReport() const {
           (unsigned long)PhiWindowTicks(), (unsigned long)rate_disp, (unsigned long)rate_ticks,
           (unsigned long)phi_sweep_max_.load(std::memory_order_relaxed),
           (unsigned long)phi_shape_overflow_.load(std::memory_order_relaxed),
-          (unsigned long)shape_live, (unsigned long)shape_open);
+          (unsigned long)shape_live, (unsigned long)shape_open,
+          // ⛔ ADDED HERE THE SAME TURN THE COUNTER WAS ADDED. A counter with no printer is a
+          // measurement nobody can take -- the "two printers, one format string" trap in its purest
+          // form. ⚠️ Still NOT visible in production: `~Device` never runs under vLLM's `mp`
+          // executor, so this line never appears there. Until the drain guard has a trace field,
+          // production coverage of it is ZERO -- say so rather than quoting a zero from a toy.
+          (unsigned long)phi_migrate_declined_);
 }
 
 uint64_t VirtualGPU::PhiNowTicks() {
@@ -1584,11 +1590,41 @@ void VirtualGPU::AcquireQueueWithPreference() {
 // ================================================================================================
 bool VirtualGPU::ReacquireQueueExcluding(const std::unordered_set<uint64_t>& excluded_ids) {
   std::scoped_lock lock(execution());
+  // ⭐⭐ THE DRAIN GUARD. Under the policy the queue PIN no longer vetoes a release and the flat-path
+  // idle suppression is lifted, so an internal graph stream CAN change queue between launches and a
+  // collision -- hence an undrained migration here -- becomes reachable for the first time. Those
+  // two mechanisms were the coupling that kept this dormant; removing them without replacing them
+  // would convert a latent defect into a live one. This is the replacement.
+  // ⛔ It must therefore land WITH the changes that remove the coupling, never after them.
+  // ⚠️ `IsQueueIdle()` is ONE-SIDED: false means "cannot prove drained", not "busy". So this
+  // declines some migrations that would have been safe. That is the intended trade -- declining
+  // yields a queue collision, which the caller ALREADY handles and logs as best-effort
+  // ("Could not resolve queue collision for stream"), whereas proceeding undrained is unsound.
+  // ⭐ The lost-migration rate is bounded by how often idle is unprovable, which is exactly what the
+  // flat-path fix above repairs; without that fix this guard would decline constantly and neuter
+  // the collision avoidance this function exists for. The two changes need each other.
+  // Cost: two integer compares, a pointer read and at most one relaxed signal load, at most once
+  // per internal stream per launch, already inside `execution()`. Not on any dispatch path.
+  if (dev().PhiUnbypassed() && gpu_queue_ != nullptr && !IsQueueIdle()) {
+    ++phi_migrate_declined_;
+    return false;  // caller treats this as an unresolved collision; that path already exists
+  }
   if (gpu_queue_ != nullptr) {
     // Detach from the current queue: decrements refCount in the pool but never
     // destroys the queue.
     // Unlike ReleaseActiveQueue, this is unconditional — we are switching queues,
     // not conditionally reclaiming under pressure.
+    // ⛔⛔ FILED, NOT FIXED: THIS MIGRATION IS NOT DRAIN-GATED. `ReleaseHwQueue()` moves a stream
+    // only when `IsQueueIdle()` proves its last packet complete; this path checks nothing. That
+    // matters because `BuildSyncPlan` PASS 1/PASS 2 elide waits between segments that share a
+    // logical `stream_id`, on the premise that a logical stream IS one in-order HW queue. Moving
+    // an undrained stream breaks that premise directly. It appears SAFE TODAY only because both
+    // callers (`GraphExecBase::CreateStreams` / `EnsureCrossDeviceStream`, at creation, and
+    // `UpdateStreams`, before any node of the launch is enqueued) happen to run when the internal
+    // stream has nothing in flight -- an INFERRED property of the callers, not an invariant this
+    // function states or enforces, and nothing checks it.
+    // ⛔ Do NOT cite this site as precedent for weakening a guard elsewhere; it is the site that
+    // needs the guard -- which is now BELOW, not merely filed.
     roc_device_.releaseQueue(gpu_queue_, std::vector<uint32_t>{}, false, true);
     gpu_queue_ = nullptr;
     if (dev().settings().queue_phi_ != 0) {
@@ -2112,8 +2148,11 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
     // and the likely mechanism behind the batch-tail hang. One per batch advances the pool exactly
     // as one ordinary dispatch does, and the signal it waits on belongs to a PREVIOUS, already
     // doorbelled batch.
-    // ⛔ NEVER the last packet: TrackQueueProgress() (`:2311`) and the `hasPendingDispatch_` clear
-    // (`:2307`) both read ONLY the final slot, so an interior packet cannot disturb queue-idle
+    // ⛔ NEVER the last packet: the `TrackQueueProgress(*finalLastSlot, ...)` call and the
+    // `hasPendingDispatch_` clear at the FOOT OF THIS FUNCTION (do not cite line numbers here --
+    // the two that used to be cited, `:2311` and `:2307`, had drifted by ~280 lines and pointed
+    // into an unrelated function) both read ONLY the final slot, so an interior packet cannot
+    // disturb queue-idle
     // tracking -- which is the coupling that cost 25-46x in release/reacquire churn on the
     // single-dispatch path.
     // ⭐⭐ ROTATION PERIOD = `eligible`, published for the block-mean in PhiSampleDuration(). A block
@@ -2573,24 +2612,59 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
 
   // Skip the pending dispatch only when both conditions are met: a completion
   // signal tracks the last packet and the fence is already clean (system scope).
-  // ⭐⭐ ITEM C, LIVE ONLY -- and this closes a REACHABLE hole, not a hypothetical one.
-  // `completion_signal.handle != 0` is true for a pre-patched graph tail, because it carries the
-  // GRAPH's own HW event. But that signal is not TRACKER-owned, so `TrackQueueProgress` below is
-  // called with `skip_signal = pre_patched` and leaves `last_packet_with_signal_index_` behind
-  // `last_write_index_` => `IsQueueIdle()` is false. Clearing `hasPendingDispatch_` here then
-  // removes the one thing that would have fixed it: `releaseGpuMemoryFence` (`:2804`) emits the
-  // restoring barrier only if `hasPendingDispatch_ || isFenceDirty() || external signals`, and the
-  // system-scope branch a few lines up (`:2235`) has already cleared the fence-dirty disjunct.
+  // ⭐⭐ ITEM C, LIVE ONLY. `completion_signal.handle != 0` is true for a pre-patched graph tail,
+  // because it carries the GRAPH's own HW event. But that signal is not TRACKER-owned, so
+  // `TrackQueueProgress` below is called with `skip_signal = pre_patched` and leaves
+  // `last_packet_with_signal_index_` behind `last_write_index_` => `IsQueueIdle()` is false.
+  // Clearing `hasPendingDispatch_` here then removes the one thing that would have fixed it:
+  // `releaseGpuMemoryFence` emits the restoring barrier only if
+  // `hasPendingDispatch_ || isFenceDirty() || external signals`, and the system-scope branch a few
+  // lines up has already cleared the fence-dirty disjunct.
   // ⇒ the stream becomes UNRELEASABLE until some later marker/finish/barrier happens by.
-  // TRACED, and it is gated on the tail's RELEASE SCOPE: reachable only when `lastHeader` carries a
-  // SYSTEM-scope release (so `:2235` clears fence-dirty) AND the tail has a pre-patched signal. For
-  // any other scope `setFenceDirty(true)` at `:2224` survives and the next fence restores
-  // provability -- which is why release was observed working "every round" in the probes.
-  // ⛔ It fails CONSERVATIVE (we lose a placement decision, we never take a wrong one), which is why
-  // stock keeps it. Under `PhiLive()` we would rather have the decision.
+  //
+  // ⚠️⚠️ HOW REACHABLE, HONESTLY -- NARROWER THAN "REACHABLE RATHER THAN HYPOTHETICAL", AND
+  // UNWITNESSED. Three things must hold at once, and the two obvious routes to the first one
+  // DEFEAT the second:
+  //   1. `lastHeader` carries a SYSTEM-scope release, so fence-dirty is cleared. NOT the default
+  //      here: `fenceScopeAgent_` is `AMD_OPT_FLUSH`, which defaults to 1, so a captured graph tail
+  //      is AGENT-release. It needs `addSystemScope_` to be pending.
+  //   2. The tail's signal is NOT tracker-owned. But the graph's OWN `addSystemScope()` call
+  //      (`hip_graph_internal.cpp`, the `sdma_follows` case) co-occurs with `attach_signal = true`,
+  //      and that makes the tail take `Barriers().ActiveSignal()` -- i.e. tracker-owned, so (2)
+  //      fails exactly where (1) succeeds. Reaching both needs `addSystemScope_` set from OUTSIDE
+  //      the graph (the flag is sticky and queue-wide -- a blit/copy setter carries onto the next
+  //      graph batch) together with `attach_signal == false`.
+  //   3. A pre-patched tail (`BuildSyncPlan` patches the completion signal onto
+  //      `dispatchPackets.back()`; the alternative APPENDED `CreateBarrierPacket()` has
+  //      ACQUIRE/RELEASE = NONE and so can never satisfy (1) by itself).
+  // ⇒ TRACED AS POSSIBLE, NOT AS OBSERVED. No probe has witnessed the conjunction. Do not restate
+  // it as "reachable rather than hypothetical" without a witness.
+  //
+  // ⛔ IT DOES FAIL CONSERVATIVE, and that is now checked rather than asserted: a graph launch's
+  // host-visible completion does NOT depend on this flag. `hipStreamSynchronize` waits on the
+  // launch stream's `AccumulateCommand` HW event, whose barrier packet carries the barrier bit and
+  // a TRACKER-owned signal and is submitted after every batch, so the batch is covered whatever
+  // `hasPendingDispatch_` says. The cost of the hole is a lost placement decision only.
+  // ⭐ THE END STATE IS THE UNGATED FORM. This site is the ONLY place in the tree that clears
+  // `hasPendingDispatch_` on the strength of `completion_signal.handle != 0` alone -- every other
+  // clear follows a barrier that took `ActiveSignal()`. So the gated arm preserves a test we know
+  // to be wrong, and it is worth being exact about WHY it is kept.
+  // ⛔ NOT to protect a baseline. Keeping a known-wrong test so that banked numbers stay comparable
+  // is not a reason; we can always re-baseline. The reason is a COUPLING: this suppression and the
+  // graph queue PIN together are what keep the undrained migration in `ReacquireQueueExcluding`
+  // DORMANT. Internal graph streams cannot change queue (pinned), and the launch stream usually
+  // cannot either (unprovable idle, i.e. this very hole), so the collision that would drive an
+  // undrained re-placement never arises. Ungating this ALONE removes half of that coupling and
+  // makes the hole reachable in STOCK, for every user. Whether the coupling was designed or
+  // accidental, it is load-bearing today.
+  // ⇒ ⛔⛔ THE EXIT CONDITION IS TECHNICAL, NOT A PROJECT MILESTONE. Delete the gate once
+  // `ReacquireQueueExcluding` carries an UNGATED drain guard -- that is the point at which the
+  // coupling has been REPLACED by an explicit guarantee rather than merely removed. Ordering
+  // matters and is easy to get backwards: guard first, then this. Ungating this first is the one
+  // sequence that opens the hole.
   const bool tail_signal_is_tracker_owned = !pre_patched;
   if (finalLastSlot->completion_signal.handle != 0 && !isFenceDirty() &&
-      (tail_signal_is_tracker_owned || !dev().PhiLive())) {
+      (tail_signal_is_tracker_owned || !dev().PhiUnbypassed())) {
     hasPendingDispatch_ = false;
   }
 
@@ -2964,7 +3038,7 @@ VirtualGPU::~VirtualGPU() {
                           dep_rate_disp, dep_rate_ticks,
                           phi_sweep_max_.load(std::memory_order_relaxed),
                           phi_shape_overflow_.load(std::memory_order_relaxed),
-                          shape_live, shape_open);
+                          shape_live, shape_open, phi_migrate_declined_);
   }
 
 
@@ -3264,17 +3338,35 @@ void VirtualGPU::ReleaseHwQueue() {
   // drained queue has REALISED what `BuildSyncPlan` only PROMISED, which subsumes every ordering
   // PASS 1 and PASS 2 elide, so a released graph stream has no in-flight work and no dependency can
   // be lost. Release is drain-gated, so this cannot move a stream mid-flight.
-  // ⛔ The pin is also ALREADY INCONSISTENT: `ReacquireQueueExcluding` ignores it entirely and
-  // releases unconditionally. A flag honoured here and silently bypassed there was never a
-  // guarantee, and correctness must not be built on it.
+  // ⭐ WHAT THE DRAIN PROOF HAS TO COVER, spelled out so the claim is checkable. `BuildSyncPlan`
+  // PASS 1/PASS 2 (hipamd/src/hip_graph_internal.cpp) elide a wait whenever two segments share a
+  // LOGICAL `stream_id`, on the stated premise "each stream is an in-order HW queue". Moving a
+  // stream between HW queues would break that premise -- except that release is gated on
+  // `IsQueueIdle()`, which proves THIS stream's last submitted packet has completed, so the elided
+  // ordering has already been REALISED before the queue can move. `SetGpuQueue()` additionally
+  // resets `last_aql_packet_slot_` on any binding change, so `OptimizeStreamOrderingBarrier` never
+  // compares a slot index from the OLD ring against the NEW ring's barrier high-water mark (that
+  // comparison would be meaningless across rings, and elides in the unsafe direction).
+  // ⛔⛔ DO NOT CITE `ReacquireQueueExcluding` AS PRECEDENT. It does ignore the pin -- but it also
+  // releases with NO DRAIN CHECK AT ALL, which makes it a latent undrained migration, not evidence
+  // that dropping the pin is safe. "Another site already does this" is an argument that the other
+  // site needs fixing. The load-bearing argument here is the drain gate, and only that.
   // ⭐ Its real content is a PERFORMANCE preference -- PR #5031's "so dynamic queue management
   // won't release it between launches", with Motivation/Technical-Details/JIRA all empty template
   // stubs and ordering never mentioned. That is exactly the kind of preference the policy should
   // price rather than have imposed on it.
+  // ⚠️ ADJACENT GAP, FILED NOT FIXED, and F is what starts exercising it: an internal graph stream
+  // has NO `amd::Command` enqueued on it by `EnqueueSegment` -- its data is covered by the leaf HW
+  // events carried as deps of the LAUNCH stream's accumulate barrier, and only for LEAF segments
+  // and only when `IsLeafNodeSyncRequired()`. `~GraphExecBase` calls `stream->finish()` on each of
+  // them, and `HostQueue::finish` returns WITHOUT waiting when `getLastQueuedCommand()` is null,
+  // which such a stream can be. That is a property of `HostQueue::finish` (it never reads
+  // `hasPendingDispatch_`), not of this change -- but F makes those streams move, so verify it
+  // before leaning on teardown ordering.
   // ⇒ With the pin in force, graph streams are the ONE population excluded from placement, and they
   // are the population whose first binding is chosen at capture where ~50% of acquires see a free
   // ring and ~40% are ties -- i.e. chosen with almost no information and then frozen.
-  if (dedicated_queue_ || (queue_pinned_ && !dev().PhiLive())) {
+  if (dedicated_queue_ || (queue_pinned_ && !dev().PhiUnbypassed())) {
     return;
   }
 
@@ -3344,6 +3436,19 @@ void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
   //   * it never cleared `last_hwq_`, so the STALE hint survived into the NEXT acquire and was
   //     applied there -- a preference for a queue this stream had already left.
   //     `AcquireHwQueueIfNeeded` consumes it (`last_hwq_ = nullptr`) precisely so it cannot be.
+  // ⛔⛔ THIS ONE IS UNCONDITIONAL -- IT MOVES `P0`. It is NOT gated on `PhiUnbypassed()`, so at
+  // `queue_phi_ == 0` this path now supplies `last_hwq_` as `preferred`, which in
+  // `getQueueFromPool` takes the METRIC-FREE bypass. P0 measured before this commit and P0 measured
+  // after it are DIFFERENT CONTROLS, with no symptom to distinguish them, and every P0-anchored
+  // comparison this campaign holds predates it.
+  // ⚠️ It also interacts with item B in the direction that inflates the effect: B removes the same
+  // bypass under `PhiUnbypassed()`, so this commit pushes P0 TOWARD hint-stability at the same time as
+  // PHI=4 removes it. A P0-vs-PHI4 delta measured across this boundary conflates the two.
+  // ⇒ RE-BASELINE P0 AT THIS TIP AND PRE-REGISTER IT before quoting any P0-vs-PHI4 number.
+  // (The stale-hint half of the fix -- clearing `last_hwq_` -- is a genuine defect fix and should
+  // stay unconditional; only the passing of the preference changes placement, and the helper does
+  // both. Splitting them would reintroduce the stale hint, so the answer is to re-baseline, not to
+  // gate.)
   // `submitMarker` already calls the helper; `dispatchGenericAqlPacket` acquires nothing and relies
   // on its callers. This makes the "ensure a queue" idiom uniform across the paths that have one,
   // and adds the failure log the inlined copy lacked.

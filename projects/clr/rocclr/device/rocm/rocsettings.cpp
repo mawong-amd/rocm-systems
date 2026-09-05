@@ -86,14 +86,16 @@ Settings::Settings() {
 
   // Total-slowdown placement. Subordinate to dynamic_queues_: mode 0 there disables the pool
   // release/reacquire path entirely, so this policy would have no binding events to act on.
-  // ⛔ CLAMPED. The field is 2 bits and the flag is a uint; an unclamped out-of-range value
-  // truncates to 0 and presents as a clean stock baseline, which is worse than an error.
+  // ⛔ CLAMPED. The field is 3 bits and the flag is a uint; an unclamped out-of-range value
+  // truncates and can present as a clean stock baseline, which is worse than an error.
   {
     const uint32_t requested = DEBUG_CLR_QUEUE_PHI;
-    // 0 off / 1 estimator only / 2 SHADOW (decide, log, do not act) / 3 shadow + self-timed /
-    // 4 LIVE (the policy actually decides placement).
-    // ⛔ The old comment here said "3 live" while `PhiTimed()` documented 3 as shadow+timer. The
-    // two spellings had drifted and NOTHING implemented live. Fixed rather than preserved.
+    // ⛔ THE LADDER IS DEFINED ONCE, IN rocdevice.hpp
+    // (`PhiActive`/`PhiShadow`/`PhiTimed`/`PhiUnbypassed`). Do NOT restate it here -- the restatement in
+    // this file said "3 live" while `PhiTimed()` said 3 = shadow+timer and nothing implemented
+    // live at all, and rocsettings.hpp carried a THIRD spelling. Three printers, one meaning.
+    // The only thing this site owns is the numeric ceiling, which must equal the highest mode
+    // those predicates test (`PhiUnbypassed()`: >= 4) and stay <= (1 << 3) - 1.
     const uint32_t clamped = std::min(requested, 4u);
     if (requested != clamped) {
       ClPrint(amd::LOG_WARNING, amd::LOG_INIT,

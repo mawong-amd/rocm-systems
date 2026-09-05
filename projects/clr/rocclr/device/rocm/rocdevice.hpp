@@ -736,6 +736,12 @@ class Device : public NullDevice {
   //! exactly where it mattered. One predicate, one place.
   //! Regime: cap <= numHwPipes_ means at most one queue per pipe, so W(n) == 0 and only ring
   //! sharing is priced. Outside it the policy declines (counted as `declined_regime`).
+  //! ⚠️ ONE DELIBERATE EXCEPTION, NAMED SO IT IS NOT "FIXED" AWAY: the four BOOKKEEPING sites
+  //! (`VirtualGPU` ctor slot claim, `~VirtualGPU` report, and the two `PhiPublishSlot()` calls in
+  //! `SetGpuQueue`/`ReacquireQueueExcluding`) ask `queue_phi_ != 0` WITHOUT the regime clause, on
+  //! purpose: a declined-regime run must still emit its `T313PHI ... declined_regime=` readout,
+  //! which is the only way to learn that it declined. Those sites act on nothing. Every site that
+  //! CHANGES BEHAVIOUR or SCORES must ask PhiActive()/PhiShadow()/PhiUnbypassed() and nothing else.
   bool PhiActive() const {
     return settings().queue_phi_ != 0 && settings().max_hw_queues_ <= numHwPipes_;
   }
@@ -753,9 +759,19 @@ class Device : public NullDevice {
   //! ns, i.e. it would be a ~30% observer effect if it were always on.
   bool PhiTimed() const { return PhiActive() && settings().queue_phi_ >= 3; }
 
-  //! ⭐⭐⭐ LIVE (`DEBUG_CLR_QUEUE_PHI=4`): the policy actually DECIDES placement rather than only
-  //! recording what it would have decided. **DEFAULT OFF, and every behaviour change gates on this
-  //! and nothing else.**
+  //! ⭐⭐⭐ `DEBUG_CLR_QUEUE_PHI=4`. **DEFAULT OFF, and every behaviour change gates on this and
+  //! nothing else.**
+  //! ⛔⛔ WHAT THIS MODE IS NOT: it does NOT make Phi choose the queue. NO selection code is gated
+  //! on `PhiUnbypassed()`. At PHI=4 the ring is still chosen by stock's `std::min_element` over
+  //! `QueueInfo::GetLoadMetric` in `getQueueFromPool` -- the arithmetic `refCount x depth` metric
+  //! this campaign exists to show is the WRONG aggregate. `PhiShadowReport` still only REPORTS.
+  //! ⇒ Read "live" as: THREE PLACEMENT-FREEDOM CHANGES (B, C, F) that remove hardcoded bypasses so
+  //! a future argmin has decisions left to make. Until that argmin is wired, a PHI=4 run measures
+  //! "stock's comparator, asked more often", NOT "the policy". Naming it otherwise is the failure
+  //! this file already warns about for `dynamic_queues_`: a mode whose name does not match what it
+  //! does is indistinguishable from a working one.
+  //! ⚠️ In particular item B's "the hinted queue still WINS whenever the metric agrees" means
+  //! STOCK's metric, not `H_q`. B trades a stability heuristic for stock's comparator.
   //! ⛔⛔ WHY THE GATE IS NON-NEGOTIABLE: `P0` (our runtime at `queue_phi_ == 0`), not stock, is the
   //! valid baseline for everything this campaign measures. If any of these changes fired
   //! unconditionally, P0 would stop being a control and we would lose the only clean comparison we
@@ -765,7 +781,19 @@ class Device : public NullDevice {
   //! policy cannot answer for CORRECTNESS or PHYSICS reasons. A hardcoded bypass that encodes
   //! neither is a decision taken away from the policy for a reason the policy could have priced --
   //! the same error as pricing migration at infinity.
-  bool PhiLive() const { return PhiActive() && settings().queue_phi_ >= 4; }
+  //! ⛔⛔ NAMED `PhiUnbypassed`, NOT `PhiLive`. The earlier name claimed "the policy actually
+  //! DECIDES placement" and that was FALSE: at this mode the ring is still chosen by
+  //! `std::min_element` over stock's `GetLoadMetric` (`dedicated_penalty + (depth << 4) +
+  //! refCount`). What this mode does is REMOVE THE BYPASSES so decisions reach the selector
+  //! at all, and install the drain guard that the removals make necessary:
+  //!   * the `last_hwq_` preferred-queue hint no longer returns a ring unscored;
+  //!   * `queue_pinned_` no longer vetoes a drain-gated release;
+  //!   * the flat-path idle suppression is lifted;
+  //!   * `ReacquireQueueExcluding` gains the drain guard those three make necessary.
+  //! ⚠️ So in the interim it routes MORE decisions to the very comparator this campaign
+  //! exists to replace. That is a step towards Phi driving selection, not a policy result:
+  //! **no placement number from this mode is a Phi number until Phi drives the argmin.**
+  bool PhiUnbypassed() const { return PhiActive() && settings().queue_phi_ >= 4; }
 
   //! Returns true if PM4 emulation is enabled
   bool IsPm4Emulation() const { return pm4_emulation_; }
@@ -1047,8 +1075,12 @@ class Device : public NullDevice {
     //! with the value; do not drop it from a reader.
     //! ⚠️ WIRE LAYOUT UNCHANGED. This byte was `n_imput` in the trace-v2 layout (18fa2f2611), which
     //! no collected trace carries — the DSV4 production traces are v1, where all three bytes are
-    //! reader padding. Renamed rather than added, so `PhiSelQRec` stays 48 B and every existing
-    //! reader is unaffected.
+    //! reader padding. Renamed rather than added, so at v3 `PhiSelQRec` was still 48 B and every
+    //! existing reader was unaffected.
+    //! ⛔ NO LONGER 48 B. v4 added `excluded` + `pad_[3]` below and the record is **56 B**; the
+    //! sentence above describes the v2->v3 bump only. Left standing it read as a live claim about
+    //! the current wire size, which is the exact class of stale-constant error that made a v2
+    //! reader parse v1 padding and report a confident zero.
     uint8_t n_clamp, n_nod, n_norate;
     //! ⛔ v4. 1 = this ring was in the pool but EXCLUDED from the ranking by the caller's
     //! `excluded_ids` (a graph sibling already holds it). Its aggregates below are still filled, so
@@ -1131,9 +1163,13 @@ class Device : public NullDevice {
   //! ~VirtualGPU misses every stream the program never destroyed; printing only from ~Device
   //! misses ALL of them, because `vgpus_` is already empty by then (verified: the device line
   //! prints, the per-stream lines do not). The union of the two covers both.
+  //! ⛔ ANY FIELD ADDED HERE MUST BE ADDED TO **BOTH** `T313PHIVG` PRINTERS -- the per-vgpu one in
+  //! `VirtualGPU::PhiReport` and the device-side one in `~Device` that reads this struct. Adding it
+  //! to one only is the "two printers, one format string" trap, which has now bitten this campaign
+  //! FIVE times; the tell is a field that appears in a toy log and vanishes in the other channel.
   struct PhiStreamSnapshot { uint64_t dispatches, d_ticks, samples, rejected, skipped, win,
                              rate_disp, rate_ticks, sweep_max, shape_ovf, shape_live,
-                             shape_open; };
+                             shape_open, migrate_declined; };
   mutable std::vector<PhiStreamSnapshot> phi_streams_;
   mutable amd::Monitor phi_streams_lock_;
 
@@ -1141,10 +1177,11 @@ class Device : public NullDevice {
   void PhiRecordStream(uint64_t dispatches, uint64_t d_ticks, uint64_t samples, uint64_t rejected,
                        uint64_t skipped, uint64_t win, uint64_t rate_disp, uint64_t rate_ticks,
                        uint64_t sweep_max, uint64_t shape_ovf, uint64_t shape_live,
-                       uint64_t shape_open) const {
+                       uint64_t shape_open, uint64_t migrate_declined) const {
     amd::ScopedLock l(phi_streams_lock_);
     phi_streams_.push_back({dispatches, d_ticks, samples, rejected, skipped, win, rate_disp,
-                            rate_ticks, sweep_max, shape_ovf, shape_live, shape_open});
+                            rate_ticks, sweep_max, shape_ovf, shape_live, shape_open,
+                            migrate_declined});
   }
 
  private:

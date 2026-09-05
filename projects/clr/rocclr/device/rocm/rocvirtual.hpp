@@ -1212,6 +1212,12 @@ class VirtualGPU : public device::VirtualDevice {
   //! Largest barrier-bit slot shared by every VirtualGPU using the physical HW queue.
   std::shared_ptr<std::atomic<uint64_t>> largest_aql_barrier_bit_slot_;
   //! Final AQL slot submitted by this stream, or kInvalidAqlSlot before its first packet.
+  //! ⭐ Migrations declined by the drain guard in `ReacquireQueueExcluding`. A COUNTER, not an
+  //! assert: `IsQueueIdle()` is one-sided, so a non-zero value is NOT evidence of a bug -- it is an
+  //! upper bound on the migrations that would have been undrained. **A ZERO is the conclusive
+  //! reading**: it says every re-placement was provably drained, so no cross-queue edge was
+  //! manufactured. Read it before trusting any placement result from the policy.
+  uint64_t phi_migrate_declined_ = 0;
   uint64_t last_aql_packet_slot_ = kInvalidAqlSlot;
   alignas(64) hsa_barrier_and_packet_t barrier_packet_ {};
   alignas(64) hsa_amd_barrier_value_packet_t barrier_value_packet_ {};
