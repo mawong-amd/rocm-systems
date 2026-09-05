@@ -3453,7 +3453,19 @@ bool Device::PhiTraceMapOpen() const {
   phi_map_len_ = len;
   phi_hdr_ = static_cast<PhiTraceHdr*>(m);
   phi_hdr_->magic = 0x4e435254333133ull;
-  phi_hdr_->version = 2;
+  // ⛔⛔ VERSION 3, AND THE BUMP IS LOAD-BEARING EVEN THOUGH NO FIELD MOVED. `PhiSelQRec` is
+  // still 48 B and every offset is unchanged, so a v2 reader parses a v3 file without error --
+  // which is exactly why the version must say so. Two things changed MEANING in place:
+  //   * the byte at the old `n_imput` offset is now `n_nod` (streams with a rate and NO `d`);
+  //   * `Hu`, `Tu` and `Tw` are now aggregates over `n - (n_unk + n_nod)` streams, not over `n`.
+  // A v2 file and a v3 file are therefore NOT comparable, and without this bump nothing in the
+  // file distinguishes them. ⚠️ v1 is worse and readers must special-case it: there the three
+  // counter bytes were never-written struct PADDING at the identical 48 B record size, so a
+  // v2/v3-layout reader parses them at the right offsets and gets zeros. MEASURED on the
+  // preserved DSV4 data: 6563 of 6563 records read (0,0,0). Reporting that as `n_imput = 0` is a
+  // check that cannot fail -- and an earlier commit message of ours cited exactly that as a
+  // measurement. A reader must REFUSE to report these counters for version 1, not print 0.
+  phi_hdr_->version = 3;
   phi_hdr_->sel_cap = kPhiTraceSel;
   phi_hdr_->selq_cap = kPhiTraceSelQ;
   phi_hdr_->sel_n = 0;
@@ -3513,8 +3525,15 @@ void Device::PhiTraceDump() const {
   for (uint64_t i = qdrop; i < qn; ++i) {
     const PhiSelQRec& q = phi_selq_buf_[i % kPhiTraceSelQ];
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-            "T313SELQ seq=%lu q=%lu n=%u nunk=%u rc=%u ded=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
-            (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, q.rc, (unsigned)q.ded,
+            // ⛔ TWO PRINTERS, ONE FORMAT -- the fourth recurrence in this campaign. The binary
+            // sink below is the other emitter of PhiSelQRec; the `d`-path counters reached it and
+            // never reached this line, so heap-ring mode (every toy probe) could not see them at
+            // all. `nnod` in particular is not optional here: without it `Hu`/`Tu`/`Tw` on this
+            // line are aggregates of unstated arity.
+            "T313SELQ seq=%lu q=%lu n=%u nunk=%u nnod=%u nclamp=%u nnorate=%u rc=%u ded=%u "
+            "Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
+            (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, (unsigned)q.n_nod,
+            (unsigned)q.n_clamp, (unsigned)q.n_norate, q.rc, (unsigned)q.ded,
             (double)q.Tw, (double)q.Hw, (double)q.Tu, (double)q.Hu);
   }
 }
@@ -3600,9 +3619,10 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     uint8_t ded;     //!< stock's hasDedicatedQueue_ (its 2048 metric penalty; Phi has no analogue)
     uint32_t n;      //!< streams the shadow census can see bound here
     uint32_t n_unk;  //!< ... of which contributed nothing measurable
-    //! ⭐ The three paths by which `d` reaches the bind-time decision. Everywhere else it cancels:
+    //! ⭐ The paths by which `d` reaches the bind-time decision. Everywhere else it cancels:
     //! `rho/d = (rate*d)/d = rate`, so `H_w = sum rate` regardless of `d`.
-    uint32_t n_imput, n_clamp, n_norate;
+    //! ⛔ `n_nod` is NOT diagnostic: it is the count `H_u`/`T_w`/`T_u` are MISSING. See `key()`.
+    uint32_t n_nod, n_clamp, n_norate;
     double Tw, Hw;   //!< duty-weighted aggregates
     double Tu, Hu;   //!< rho == 1
   };
@@ -3670,35 +3690,63 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
       const bool have_rate = (bs != 0 && t_ref > bs && dn >= bd);
       const uint64_t dd = have_rate ? (dn - bd) : 0;
       const uint64_t dt = have_rate ? (t_ref - bs) : 0;
-      // ⛔ SEMANTICS UNCHANGED from before the counters were added; only the three branches are
-      // now COUNTED. `rho/d == rate` in the first two, so `d` cancels; it survives only in the
-      // clamp and the no-rate branch.
+      // ⛔⛔ SPLIT BY CONSUMER, NOT BY SENTINEL. `d == 0` means "no estimate", and the four
+      // aggregates do not need the same inputs:
+      //   H_w = sum rho/d = sum (rate*d)/d = sum rate  -- needs the RATE; `d` cancels IDENTICALLY
+      //   T_w = sum rho*d,  T_u = sum d,  H_u = sum 1/d -- all genuinely `d`-valued
+      // The previous code imputed `d := 1/rate` so that ONE expression could serve all four. For
+      // H_w that is exactly right (rho == 1 and d == 1/rate give rho/d == rate); for the other
+      // three it is wrong IN KIND -- it feeds the WEIGHTED value into H_u, which is the rho == 1
+      // CONTROL the duty-weighting result rests on, and turns T_w's busy-time DURATION into an
+      // inter-dispatch PERIOD. The other option on the table, publishing the partial block mean as
+      // `d`, is wrong by a MEASURED 3.7-3.8x scale factor (see the `n < L` note in
+      // PhiSampleDuration) and in the MERGE direction.
+      // ⇒ Neither. Add `rate` to H_w directly and leave the `d`-valued aggregates alone -- but
+      // COUNT the stream, because H_u/T_w/T_u are then aggregates over `k` of `n` and a consumer
+      // that compares them across rings without the count will systematically prefer the ring with
+      // more UNMEASURED streams. See `key()` below, which is where that count is consumed.
       double rho = 1.0;
       if (d == 0) {
         if (!have_rate || dd == 0) {
           ++c.n_unk;
           continue;  // nothing measurable at all; do not invent a contribution
         }
-        d = static_cast<uint64_t>(static_cast<double>(dt) / static_cast<double>(dd));
-        if (d == 0) {
-          ++c.n_unk;
-          continue;
-        }
-        // ⛔⛔ THIS BRANCH IS UNREACHABLE, and the counter is here to keep proving it. A stream has
-        // a rate base IFF it has had a `d` sample: `phi_ep_cur_start_` is written ONLY by
-        // PhiNoteWindow, which is called ONLY from PhiSampleDuration. So `d == 0` implies no
-        // samples implies no base implies `!have_rate`, and control never reaches here -- it exits
-        // via `n_unk` above. MEASURED n_imput = 0 in every run. The "impute d := 1/rate" design note
-        // describes a path that does not execute; do not cite it as live behaviour.
-        ++c.n_imput;
-      } else if (have_rate) {
+        // ⛔⛔ REACHABLE. An earlier comment here claimed otherwise, on the argument that a stream
+        // has a rate base IFF it has had a `d` sample. That holds only for streams which never
+        // take the block-mean path: there PhiSampleDuration stores `phi_d_ticks_` and calls
+        // PhiNoteWindow in the same breath, so base and `d` appear together and `d == 0` really
+        // does imply `!have_rate`. A GRAPH stream with an OPEN block (`n < L`) calls PhiNoteWindow
+        // and PhiPublishSlot and deliberately does NOT store `phi_d_ticks_`, so it publishes
+        // `base_start != 0` with `d_ticks == 0` for as long as `shape_open > 0` -- which in a
+        // graph-heavy workload can be the entire run.
+        // ⚠️ NO CLAMP IS AVAILABLE HERE, and that is not an oversight. With `d` known the clamp
+        // bounds the contribution by the ring's own service capacity `1/d`; with `d` unknown there
+        // is no such bound, and a backlogged graph stream submits faster than it completes. The
+        // error is therefore unbounded -- but in the OVER-price direction, i.e. spread, which
+        // CLAIM S makes the safe one.
+        ++c.n_nod;
+        c.Hw += static_cast<double>(dd) / static_cast<double>(dt);
+        continue;  // ⛔ NOT `Tw`/`Tu`/`Hu`: there is no `d` to put in them.
+      }
+      if (have_rate) {
         const double r = static_cast<double>(dd) / static_cast<double>(dt);
         rho = r * static_cast<double>(d);
+        // ⛔ THE CLAMP IS NOT REDUNDANT WITH `H_w += rate`. Unclamped, `rho/d == rate` exactly and
+        // the two forms agree; clamped, the contribution becomes `1/d`, which is SMALLER. So the
+        // general weighted term is `min(rate, 1/d)` -- a saturated or `d`-over-estimated stream is
+        // priced at the ring's service capacity, not at its own measured submit rate. Replacing
+        // the whole loop with `H_w += rate` would silently drop that bound.
         if (rho > 1.0) {
           rho = 1.0;
           ++c.n_clamp;  // ⭐ contribution becomes 1/d -- one of only two paths where `d` decides
         }
-        if (rho < 0.0) rho = 0.0;
+        // (An `if (rho < 0.0) rho = 0.0;` used to sit here. It is DEAD, and a check that cannot
+        // fail is indistinguishable from one that passes. ⛔ But the reason is NOT merely that the
+        // operands came from unsigned words -- it is that `have_rate` above requires BOTH
+        // `dn >= bd` AND `t_ref > bs`, which is what gives `dd >= 0` and `dt >= 1`; with `d != 0`
+        // here, `rho >= 0` follows, and `dt >= 1` also rules out a `0/0` NaN. ⚠️ Relaxing either
+        // half of `have_rate` reopens this. That is the dependency the deleted line stood on
+        // silently, and naming it is the whole reason the deletion is safe to make.)
       } else {
         // ⚠️ Near-unreachable for the same reason inverted: `d != 0` implies a base exists, so this
         // needs `t_ref <= base_start` or a torn pair -- and the seqlock closed the tear.
@@ -3769,10 +3817,20 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   //!    having measured it: the `d == 0` => FREE trap, one level up at ring granularity. Ranked
   //!    strictly worst instead. MEASURED: Phi's argmin landed on such a ring 9/9 times in the
   //!    stagger cell.
-  struct MetricKey { int occ, blind; double H; };
+  //! ⛔⛔ `blind` IS PER ARM, BECAUSE THE TWO ARMS NEED DIFFERENT INPUTS. `H_w` needs the RATE
+  //! (`d` cancels); `H_u = sum 1/d` needs `d`. A stream with a rate and no `d` therefore
+  //! contributes to `H_w` and NOTHING to `H_u` -- so an unweighted `H_u` of 0 no longer implies
+  //! "nothing measurable", and asking `n == n_unk` for both arms would let a ring made entirely of
+  //! `d`-less streams read `H_u == 0` with `blind == 0`: exactly the trap above, reintroduced in
+  //! the control arm. `unmeas` is the count each arm is actually MISSING, and it is also the
+  //! quantity the H-tie-break wants. ⭐ This is the "the count must travel with the value" rule
+  //! made structural: `H_u`/`T_w`/`T_u` are aggregates over `n - (n_unk + n_nod)` streams and any
+  //! consumer comparing them across rings must say so.
+  struct MetricKey { int occ, blind; double H; uint32_t unmeas; };
   auto key = [](const Cand& c, bool weighted) {
     const int occ = (c.rc != 0) ? 1 : 0;
-    return MetricKey{occ, (occ != 0 && c.n == c.n_unk) ? 1 : 0, weighted ? c.Hw : c.Hu};
+    const uint32_t unmeas = weighted ? c.n_unk : (c.n_unk + c.n_nod);
+    return MetricKey{occ, (occ != 0 && c.n == unmeas) ? 1 : 0, weighted ? c.Hw : c.Hu, unmeas};
   };
   auto better = [pipes, &key](const Cand& a, const Cand& b, bool weighted) {
     const MetricKey ka = key(a, weighted), kb = key(b, weighted);
@@ -3780,7 +3838,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     if (ka.blind != kb.blind) return ka.blind < kb.blind;    // "unmeasured" is not "empty"
     if (ka.H != kb.H) return ka.H < kb.H;
     // --- below here: TIE-BREAKS ONLY. They name a winner and carry no information. ---
-    if (a.n_unk != b.n_unk) return a.n_unk < b.n_unk;        // prefer the ring we know most about
+    if (ka.unmeas != kb.unmeas) return ka.unmeas < kb.unmeas;  // prefer the ring we know most about
     const uint64_t pa = a.q->id % pipes, pb = b.q->id % pipes;
     if (pa != pb) return pa < pb;                            // stock's pipe_dist tie-break
     return a.q->id < b.q->id;
@@ -3854,7 +3912,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     qr.q = c.q->id;
     qr.n = c.n;
     qr.n_unk = c.n_unk;
-    qr.n_imput = static_cast<uint8_t>(c.n_imput > 255 ? 255 : c.n_imput);
+    qr.n_nod = static_cast<uint8_t>(c.n_nod > 255 ? 255 : c.n_nod);
     qr.n_clamp = static_cast<uint8_t>(c.n_clamp > 255 ? 255 : c.n_clamp);
     qr.n_norate = static_cast<uint8_t>(c.n_norate > 255 ? 255 : c.n_norate);
     qr.rc = c.rc;

@@ -1019,14 +1019,23 @@ class Device : public NullDevice {
     uint64_t seq, q;
     uint32_t n, n_unk, rc;
     uint8_t ded;
-    //! ⭐ THE ONLY THREE PATHS BY WHICH `d` REACHES THE BIND-TIME DECISION. Everywhere else it
-    //! cancels identically: `rho/d = (rate*d)/d = rate`, so `H_w = sum rate` regardless of `d`.
-    //! It survives only when (a) the rho clamp fires (`rate > 1/d` => contribution becomes `1/d`),
-    //! (b) `d` was unknown and imputed as `1/rate` (contribution is still exactly `rate`, but the
-    //! stream is an estimator fallback worth counting), or (c) `d` is known but the RATE is not, so
-    //! rho defaults to 1 and the contribution is `1/d`. (c) is common at STARTUP, before an epoch
-    //! base exists — which is a candidate explanation for lifetime-vs-window divergence.
-    uint8_t n_clamp, n_imput, n_norate;
+    //! ⭐ WHERE `d` REACHES THE BIND-TIME DECISION. Everywhere else it cancels identically:
+    //! `rho/d = (rate*d)/d = rate`, so `H_w = sum rate` regardless of `d`. It survives only when
+    //! (a) the rho clamp fires (`rate > 1/d` => the weighted term becomes `1/d`, i.e. the general
+    //! form is `min(rate, 1/d)` and the clamp is the `1/d` half of it), or (c) `d` is known but the
+    //! RATE is not, so rho defaults to 1 and the contribution is `1/d`. (c) is common at STARTUP,
+    //! before an epoch base exists — a candidate explanation for lifetime-vs-window divergence.
+    //! ⛔⛔ `n_nod` IS NOT A DIAGNOSTIC COUNTER, IT IS PART OF THE VALUE. Streams with a rate and no
+    //! `d` contribute `rate` to `H_w` and NOTHING to `T_w`/`T_u`/`H_u`, so those three are
+    //! aggregates over `n - (n_unk + n_nod)` streams, not over `n`. Any scorer that compares them
+    //! across rings without normalising by that count systematically prefers the ring with more
+    //! unmeasured streams — the merge-ward trap `n_unk` already exists to guard. The count travels
+    //! with the value; do not drop it from a reader.
+    //! ⚠️ WIRE LAYOUT UNCHANGED. This byte was `n_imput` in the trace-v2 layout (18fa2f2611), which
+    //! no collected trace carries — the DSV4 production traces are v1, where all three bytes are
+    //! reader padding. Renamed rather than added, so `PhiSelQRec` stays 48 B and every existing
+    //! reader is unaffected.
+    uint8_t n_clamp, n_nod, n_norate;
     float Tw, Hw, Tu, Hu;
   };
   //! ⭐ PER-STREAM SNAPSHOT. The ring aggregates above cannot answer "what is the duty
