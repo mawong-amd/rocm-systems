@@ -2202,6 +2202,25 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
   if (firstHeaderRequestedBarrier) {
     OptimizeStreamOrderingBarrier(firstHeader, reservation);
   }
+  // Publish this batch's barrier-bit high-water mark to the queue-wide tracker. Every
+  // single-packet path (dispatchGenericAqlPacket, dispatchBarrierPacket,
+  // dispatchBarrierValuePacket) does this; the flat batch path did not, so a graph's barrier=1
+  // packets stayed invisible to OptimizeStreamOrderingBarrier and every other stream sharing the
+  // HW queue kept barrier bits it could have elided. The omission was SAFE -- the tracker is a
+  // monotone max, so under-reporting only ever keeps bits -- but it is not free: a kept barrier
+  // bit costs ~24.6 ns x min(nwg, 256).
+  // Only the largest barrier-bit slot matters, so scan backwards and stop at the first hit.
+  // Use the headers actually committed to the ring: packet 0 gets firstHeader (which
+  // OptimizeStreamOrderingBarrier above may just have cleared) and the tail gets lastHeader.
+  for (size_t i = numPackets; i-- > 0;) {
+    const uint16_t committed_hdr = (i == 0)                ? firstHeader
+                                   : (i == numPackets - 1) ? lastHeader
+                                   : static_cast<uint16_t>(validFullHeaders[i]);
+    if ((committed_hdr & kBarrierBit) != 0) {
+      RecordAqlPacketHeader(reservation, i, committed_hdr);
+      break;
+    }
+  }
 
   CompleteAqlSubmission(reservation);
   setFenceDirty(true);
@@ -3283,10 +3302,23 @@ void releaseSdmaProfiling() {
  * and then calls start() to get the current host timestamp.
  */
 void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
-  // Dedicated queues keep their HW queue, never acquire from pool
-  if (!dedicated_queue_ && gpu_queue_ == nullptr) {
-    SetGpuQueue(roc_device_.AcquireActiveQueue(priority_));
-  }
+  // Dedicated queues keep their HW queue, never acquire from pool.
+  // ⭐ Use the shared helper instead of inlining the acquire. The guard here was already
+  // character-for-character `AcquireHwQueueIfNeeded()`'s, but the inlined body differed in two ways
+  // that matter to placement:
+  //   * it passed NO preferred queue, discarding the `last_hwq_` hint on a path that reacquires
+  //     after an idle release, so a stream that would have returned to its previous ring was
+  //     instead re-ranked from scratch;
+  //   * it never cleared `last_hwq_`, so the STALE hint survived into the NEXT acquire and was
+  //     applied there -- a preference for a queue this stream had already left.
+  //     `AcquireHwQueueIfNeeded` consumes it (`last_hwq_ = nullptr`) precisely so it cannot be.
+  // `submitMarker` already calls the helper; `dispatchGenericAqlPacket` acquires nothing and relies
+  // on its callers. This makes the "ensure a queue" idiom uniform across the paths that have one,
+  // and adds the failure log the inlined copy lacked.
+  // ⛔ Deliberately NOT adding a bare `gpu_queue_ == nullptr` guard to the flat batch path: no
+  // sibling dispatch path has one, and an unreachable check is indistinguishable from one that
+  // passes. Follow the idiom rather than hardening one path in isolation.
+  AcquireHwQueueIfNeeded();
   // Track the current command
   command_ = &command;
 
