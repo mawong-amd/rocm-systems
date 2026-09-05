@@ -950,6 +950,16 @@ class Device : public NullDevice {
     //! and makes the ring look MORE attractive: the MERGE direction, which is the unsafe one. An
     //! earlier comment of mine called that "harmless: a slightly low rate"; the magnitude is
     //! bounded to one epoch but the DIRECTION is the wrong one, so it is closed rather than noted.
+    //! ⭐⭐ DIAGNOSTIC COUNTERS, v5. ⛔ DELIBERATELY **OUTSIDE** the seqlocked (start, disp) pair:
+    //! they are independent scalars, so a torn read costs one stale diagnostic and never a
+    //! mis-priced ring. Do NOT fold them into the seqlock -- that would widen the critical section
+    //! on the dispatch path to protect values nothing prices.
+    //! ⭐ WHY THEY ARE HERE AT ALL: `samples == 0` is the DIRECT answer to "why does this stream
+    //! contribute nothing", which is the open production question (43-45% of streams have no rate
+    //! base). `rejected` and `skipped` say WHICH way it failed. Without these the question is
+    //! unanswerable from a production trace, because `~Device` never runs under vLLM's `mp`
+    //! executor and the `T313PHIVG` line that carries them never appears there.
+    std::atomic<uint64_t> samples{0}, rejected{0}, skipped{0}, migrate_declined{0};
     std::atomic<uint64_t> seq{0};  //!< odd = write in progress
     std::atomic<uint64_t> base_start{0};
     std::atomic<uint64_t> base_disp{0};
@@ -1018,9 +1028,18 @@ class Device : public NullDevice {
   //! a reader pairing a NEW `disp_now` with an OLD base over-counts the numerator, i.e. reads the
   //! rate too HIGH, which over-prices and therefore SPREADS -- the safe direction. The pair that
   //! must not tear is (base_start, base_disp), and that is exactly what `seq` covers.
-  void PhiPublishDisp(uint32_t idx, uint64_t disp_now) const {
+  //! ⚠️ Called per DISPATCH BATCH, not per packet, and it already dirties this cache line -- which
+  //! is why the four diagnostics ride along here rather than in their own publish. Four relaxed
+  //! stores on an already-owned line.
+  void PhiPublishDisp(uint32_t idx, uint64_t disp_now, uint64_t samples, uint64_t rejected,
+                      uint64_t skipped, uint64_t migrate_declined) const {
     if (idx >= kPhiMaxStreams) return;
-    phi_slots_[idx].disp_now.store(disp_now, std::memory_order_relaxed);
+    PhiStreamSlot& sl = phi_slots_[idx];
+    sl.disp_now.store(disp_now, std::memory_order_relaxed);
+    sl.samples.store(samples, std::memory_order_relaxed);
+    sl.rejected.store(rejected, std::memory_order_relaxed);
+    sl.skipped.store(skipped, std::memory_order_relaxed);
+    sl.migrate_declined.store(migrate_declined, std::memory_order_relaxed);
   }
   //! Streams that found no slot, i.e. are invisible to the shadow census. ⛔ Must be REPORTED: an
   //! invisible stream lowers a ring's `n` and can make an occupied ring read as free, which
@@ -1106,6 +1125,9 @@ class Device : public NullDevice {
   //! against any `t_ref` it likes.
   struct PhiSlotRec {
     uint64_t t_ref, queue_id, d_ticks, base_start, base_disp, disp_now;
+    //! v5. `disp_now` is already the dispatch count, so the yield question is answered by
+    //! `samples == 0 && disp_now > 0` -- an ACTIVE stream that never produced a `d` sample.
+    uint64_t samples, rejected, skipped, migrate_declined;
     uint32_t slot;
     uint32_t pad_;
   };
@@ -1141,7 +1163,14 @@ class Device : public NullDevice {
   //! File header, mapped at offset 0, so a reader knows what it has without our process.
   struct PhiTraceHdr {
     uint64_t magic, version, sel_cap, selq_cap, sel_n, selq_n, pid, dev;
-    uint64_t slot_cap, slot_n, snap_every, reserved_;  //!< v2
+    uint64_t slot_cap, slot_n, snap_every, reserved_;  //!< v2 (`reserved_` = HSA agent handle, v4)
+    //! ⭐⭐ v5: the `T313PHI` device line, in the trace. These existed ONLY at teardown, at LOG_INFO
+    //! on LOG_QUEUE -- i.e. nowhere at all under vLLM's `mp` executor, which never runs `~Device`.
+    //! `bypass_preferred` in particular is the number that separates "the policy did nothing" from
+    //! "the policy was never asked", and it was unreadable in exactly the workload that matters.
+    //! Refreshed at every snapshot, so they are a time series rather than a final tally.
+    uint64_t reached, eligible, declined_regime, bypass_preferred, slot_ovf;
+    uint64_t mode, cap, pipes;  //!< the regime, so a trace is self-describing without the log
   };
   mutable PhiTraceHdr* phi_hdr_ = nullptr;
   //! Open the mmap sink if DEBUG_CLR_PHI_TRACE is set. Returns false to fall back to the heap ring.

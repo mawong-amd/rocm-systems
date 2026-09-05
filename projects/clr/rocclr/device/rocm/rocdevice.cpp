@@ -3499,7 +3499,7 @@ bool Device::PhiTraceMapOpen() const {
   // reader fails loudly rather than quietly -- but dispatch on the version anyway.
   // ⭐ `PhiSelRec::cands` still counts RANKABLE candidates only, and excluded records are flagged,
   // so filtering on the flag reproduces v3's numbers exactly.
-  phi_hdr_->version = 4;
+  phi_hdr_->version = 5;
   phi_hdr_->sel_cap = kPhiTraceSel;
   phi_hdr_->selq_cap = kPhiTraceSelQ;
   phi_hdr_->sel_n = 0;
@@ -3534,6 +3534,11 @@ bool Device::PhiTraceMapOpen() const {
   // ⚠️ v3 files written before this line carry 0 here; 0 is not a valid agent handle, so a reader
   // can tell "unset" from a real value without another version bump.
   phi_hdr_->reserved_ = static_cast<uint64_t>(bkendDevice_.handle);
+  phi_hdr_->reached = phi_hdr_->eligible = phi_hdr_->declined_regime = 0;
+  phi_hdr_->bypass_preferred = phi_hdr_->slot_ovf = 0;
+  phi_hdr_->mode = settings().queue_phi_;
+  phi_hdr_->cap = settings().max_hw_queues_;
+  phi_hdr_->pipes = numHwPipes_;
   phi_sel_buf_ = reinterpret_cast<PhiSelRec*>(static_cast<char*>(m) + sizeof(PhiTraceHdr));
   phi_selq_buf_ = reinterpret_cast<PhiSelQRec*>(
       static_cast<char*>(m) + sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec));
@@ -3599,6 +3604,16 @@ void Device::PhiTraceDump() const {
 // ⭐ Stores the rate BASE rather than a computed rate, so a reader can evaluate it against whatever
 // `t_ref` it likes -- and so a REBIND analysis, where `d` stops cancelling, has what it needs.
 void Device::PhiTraceSnapshot(uint64_t t_ref) const {
+  // ⭐ v5: refresh the device-level stats in the header on every snapshot, so a trace carries the
+  // `T313PHI` numbers as a TIME SERIES and is readable without the teardown log -- which under
+  // vLLM's `mp` executor never happens at all.
+  if (phi_hdr_ != nullptr) {
+    phi_hdr_->reached = phi_stats_.reached.load(std::memory_order_relaxed);
+    phi_hdr_->eligible = phi_stats_.eligible.load(std::memory_order_relaxed);
+    phi_hdr_->declined_regime = phi_stats_.declined_regime.load(std::memory_order_relaxed);
+    phi_hdr_->bypass_preferred = phi_stats_.bypass_preferred.load(std::memory_order_relaxed);
+    phi_hdr_->slot_ovf = PhiSlotOverflow();
+  }
   const size_t hi = phi_slot_hi_.load(std::memory_order_relaxed);
   for (size_t i = 0; i < hi; ++i) {
     const PhiStreamSlot& sl = phi_slots_[i];
@@ -3615,6 +3630,10 @@ void Device::PhiTraceSnapshot(uint64_t t_ref) const {
     r.base_start = sl.base_start.load(std::memory_order_relaxed);
     r.base_disp = sl.base_disp.load(std::memory_order_relaxed);
     r.disp_now = sl.disp_now.load(std::memory_order_relaxed);
+    r.samples = sl.samples.load(std::memory_order_relaxed);
+    r.rejected = sl.rejected.load(std::memory_order_relaxed);
+    r.skipped = sl.skipped.load(std::memory_order_relaxed);
+    r.migrate_declined = sl.migrate_declined.load(std::memory_order_relaxed);
     r.slot = static_cast<uint32_t>(i);
     r.pad_ = 0;
   }

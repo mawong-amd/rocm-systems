@@ -893,7 +893,9 @@ void VirtualGPU::PhiPublishSlot() const {
 void VirtualGPU::PhiNoteDispatch(uint64_t k) const {
   const uint64_t n = phi_dispatches_.fetch_add(k, std::memory_order_relaxed) + k;
   if (phi_slot_ != 0xFFFFFFFFu) {
-    dev().PhiPublishDisp(phi_slot_, n);
+    dev().PhiPublishDisp(phi_slot_, n, phi_d_samples_.load(std::memory_order_relaxed),
+                         phi_d_rejected_.load(std::memory_order_relaxed),
+                         phi_d_skipped_.load(std::memory_order_relaxed), phi_migrate_declined_);
   }
 }
 
