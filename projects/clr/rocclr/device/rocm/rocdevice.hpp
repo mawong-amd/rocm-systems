@@ -1000,6 +1000,11 @@ class Device : public NullDevice {
   //! silently absorbed -- a truncated trace that looks complete is worse than no trace.
   //! ⚠️ An unclean kill (SIGKILL of a server) loses the trace entirely. Arrange a clean shutdown.
   struct PhiSelRec {
+    //! ⭐ `t_ref` is FREE: PhiShadowReport already reads it once per decision for the rate's common
+    //! right edge, so recording it is one store of a value we have. It is also the single
+    //! highest-value field: without it the trace CANNOT BE SEGMENTED IN TIME, and the in-workload
+    //! window's boundary moves the unweighted headline from 21.4% to 48.8% or 2.0%.
+    uint64_t t_ref;
     uint64_t seq, stock, phi_w, phi_u;
     uint32_t cands, n_free, n_meas, mult_w, mult_u;
     int8_t eval_w, eval_u, agree_w, agree_u, wu_same, via_bypass;
@@ -1014,10 +1019,40 @@ class Device : public NullDevice {
     uint64_t seq, q;
     uint32_t n, n_unk, rc;
     uint8_t ded;
+    //! ⭐ THE ONLY THREE PATHS BY WHICH `d` REACHES THE BIND-TIME DECISION. Everywhere else it
+    //! cancels identically: `rho/d = (rate*d)/d = rate`, so `H_w = sum rate` regardless of `d`.
+    //! It survives only when (a) the rho clamp fires (`rate > 1/d` => contribution becomes `1/d`),
+    //! (b) `d` was unknown and imputed as `1/rate` (contribution is still exactly `rate`, but the
+    //! stream is an estimator fallback worth counting), or (c) `d` is known but the RATE is not, so
+    //! rho defaults to 1 and the contribution is `1/d`. (c) is common at STARTUP, before an epoch
+    //! base exists — which is a candidate explanation for lifetime-vs-window divergence.
+    uint8_t n_clamp, n_imput, n_norate;
     float Tw, Hw, Tu, Hu;
   };
+  //! ⭐ PER-STREAM SNAPSHOT. The ring aggregates above cannot answer "what is the duty
+  //! distribution" or "which ring is this stream on over time" — both of which we have already had
+  //! to reconstruct by one-off analysis. Written periodically, amortised to ~10 B/decision.
+  //! ⭐ FUTURE-PROOFING FOR REBIND: there `d` stops cancelling (`T_q = sum rate*d^2`, and dPhi needs
+  //! the joiner's own `d`), the `dPhi(leave)` term needs each stream's current ring, and
+  //! oscillation detection needs the per-stream sequence of rings. All three come from this record.
+  //! The published rate BASE is stored rather than a computed rate, so a reader can evaluate it
+  //! against any `t_ref` it likes.
+  struct PhiSlotRec {
+    uint64_t t_ref, queue_id, d_ticks, base_start, base_disp, disp_now;
+    uint32_t slot;
+    uint32_t pad_;
+  };
   static constexpr size_t kPhiTraceSel = 1u << 16;   //!< 64 Ki decisions   (~2.6 MB)
-  static constexpr size_t kPhiTraceSelQ = 1u << 18;  //!< 256 Ki candidates (~10 MB)
+  static constexpr size_t kPhiTraceSelQ = 1u << 18;  //!< 256 Ki candidates (~13 MB)
+  static constexpr size_t kPhiTraceSlot = 1u << 16;  //!< 64 Ki slot samples (~3.7 MB)
+  //! Snapshot cadence in DECISIONS, overridable with `DEBUG_CLR_PHI_SNAP`. ⚠️ The default of 1000
+  //! yields only ONE snapshot on a 331-decision probe and four on a 3,660-decision server run --
+  //! too thin to characterise a duty distribution. Bounded by decisions rather than time so the
+  //! cost stays proportional to activity.
+  static constexpr uint64_t kPhiSnapEveryDefault = 100;
+  mutable uint64_t phi_snap_every_ = kPhiSnapEveryDefault;
+  mutable PhiSlotRec* phi_slot_buf_ = nullptr;
+  mutable std::atomic<uint64_t> phi_trace_slot_n_{0};
   //! ⛔⛔ THE TRACE MUST SURVIVE A SIGNAL. MEASURED: with the ring in heap memory and dumped from
   //! ~Device, a mid-run **SIGTERM** loses the ENTIRE trace (SELSUM=0, SEL=0), as does SIGKILL,
   //! while a clean exit yields SELSUM=1. SIGTERM matters because that is how a server is normally
@@ -1039,6 +1074,7 @@ class Device : public NullDevice {
   //! File header, mapped at offset 0, so a reader knows what it has without our process.
   struct PhiTraceHdr {
     uint64_t magic, version, sel_cap, selq_cap, sel_n, selq_n, pid, dev;
+    uint64_t slot_cap, slot_n, snap_every, reserved_;  //!< v2
   };
   mutable PhiTraceHdr* phi_hdr_ = nullptr;
   //! Open the mmap sink if DEBUG_CLR_PHI_TRACE is set. Returns false to fall back to the heap ring.
@@ -1051,6 +1087,8 @@ class Device : public NullDevice {
  public:
   //! Format and emit the whole trace. Called once, at device teardown.
   void PhiTraceDump() const;
+  //! Write one PhiSlotRec per live slot. Called every kPhiSnapEvery decisions.
+  void PhiTraceSnapshot(uint64_t t_ref) const;
 
  private:
 

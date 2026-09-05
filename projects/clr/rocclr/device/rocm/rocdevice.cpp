@@ -3430,7 +3430,7 @@ bool Device::PhiTraceMapOpen() const {
     return false;  // unconfigured: fall back to the heap ring + teardown dump
   }
   const size_t len = sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec) +
-                     kPhiTraceSelQ * sizeof(PhiSelQRec);
+                     kPhiTraceSelQ * sizeof(PhiSelQRec) + kPhiTraceSlot * sizeof(PhiSlotRec);
   // ⭐ pid AND device index in the name. Eight TP ranks are eight PROCESSES with eight independent
   // `seq` counters; pooling them is a scorer bug that separate files make impossible.
   char path[1024];
@@ -3453,16 +3453,28 @@ bool Device::PhiTraceMapOpen() const {
   phi_map_len_ = len;
   phi_hdr_ = static_cast<PhiTraceHdr*>(m);
   phi_hdr_->magic = 0x4e435254333133ull;
-  phi_hdr_->version = 1;
+  phi_hdr_->version = 2;
   phi_hdr_->sel_cap = kPhiTraceSel;
   phi_hdr_->selq_cap = kPhiTraceSelQ;
   phi_hdr_->sel_n = 0;
   phi_hdr_->selq_n = 0;
   phi_hdr_->pid = static_cast<uint64_t>(getpid());
   phi_hdr_->dev = index();
+  phi_hdr_->slot_cap = kPhiTraceSlot;
+  phi_hdr_->slot_n = 0;
+  { const char* sv = getenv("DEBUG_CLR_PHI_SNAP");
+    if (sv != nullptr && sv[0] != '\0') {
+      const long v = strtol(sv, nullptr, 10);
+      if (v > 0) phi_snap_every_ = static_cast<uint64_t>(v);
+    } }
+  phi_hdr_->snap_every = phi_snap_every_;
+  phi_hdr_->reserved_ = 0;
   phi_sel_buf_ = reinterpret_cast<PhiSelRec*>(static_cast<char*>(m) + sizeof(PhiTraceHdr));
   phi_selq_buf_ = reinterpret_cast<PhiSelQRec*>(
       static_cast<char*>(m) + sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec));
+  phi_slot_buf_ = reinterpret_cast<PhiSlotRec*>(
+      static_cast<char*>(m) + sizeof(PhiTraceHdr) + kPhiTraceSel * sizeof(PhiSelRec) +
+      kPhiTraceSelQ * sizeof(PhiSelQRec));
   return true;
 }
 
@@ -3504,6 +3516,35 @@ void Device::PhiTraceDump() const {
             "T313SELQ seq=%lu q=%lu n=%u nunk=%u rc=%u ded=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
             (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, q.rc, (unsigned)q.ded,
             (double)q.Tw, (double)q.Hw, (double)q.Tu, (double)q.Hu);
+  }
+}
+
+// ================================================================================================
+// ⭐ Per-stream snapshot. The ring aggregates in PhiSelQRec cannot answer "what is the duty
+// distribution" or "which ring has this stream been on", both of which we have already had to
+// reconstruct by one-off analysis of the aggregates. Amortised to ~10 B/decision at the default
+// cadence, and the loop is bounded by the high-water mark, not the table size.
+// ⭐ Stores the rate BASE rather than a computed rate, so a reader can evaluate it against whatever
+// `t_ref` it likes -- and so a REBIND analysis, where `d` stops cancelling, has what it needs.
+void Device::PhiTraceSnapshot(uint64_t t_ref) const {
+  const size_t hi = phi_slot_hi_.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < hi; ++i) {
+    const PhiStreamSlot& sl = phi_slots_[i];
+    const uint64_t qid = sl.queue_id.load(std::memory_order_acquire);
+    if (qid == 0) {
+      continue;  // slot not live / not bound
+    }
+    const uint64_t k = phi_trace_slot_n_.fetch_add(1, std::memory_order_relaxed);
+    if (phi_hdr_ != nullptr) phi_hdr_->slot_n = k + 1;
+    PhiSlotRec& r = phi_slot_buf_[k % kPhiTraceSlot];
+    r.t_ref = t_ref;
+    r.queue_id = qid;
+    r.d_ticks = sl.d_ticks.load(std::memory_order_relaxed);
+    r.base_start = sl.base_start.load(std::memory_order_relaxed);
+    r.base_disp = sl.base_disp.load(std::memory_order_relaxed);
+    r.disp_now = sl.disp_now.load(std::memory_order_relaxed);
+    r.slot = static_cast<uint32_t>(i);
+    r.pad_ = 0;
   }
 }
 
@@ -3559,6 +3600,9 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     uint8_t ded;     //!< stock's hasDedicatedQueue_ (its 2048 metric penalty; Phi has no analogue)
     uint32_t n;      //!< streams the shadow census can see bound here
     uint32_t n_unk;  //!< ... of which contributed nothing measurable
+    //! ⭐ The three paths by which `d` reaches the bind-time decision. Everywhere else it cancels:
+    //! `rho/d = (rate*d)/d = rate`, so `H_w = sum rate` regardless of `d`.
+    uint32_t n_imput, n_clamp, n_norate;
     double Tw, Hw;   //!< duty-weighted aggregates
     double Tu, Hu;   //!< rho == 1
   };
@@ -3572,7 +3616,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     }
     cands.push_back(Cand{q, static_cast<uint32_t>(entry.second.refCount),
                          static_cast<uint8_t>(entry.second.hasDedicatedQueue_ ? 1 : 0),
-                         0, 0, 0.0, 0.0, 0.0, 0.0});
+                         0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0});
   }
   if (!cands.empty()) {
     // ⛔ Read the device's fixed slot array, NEVER `vgpus()` -- that vector is resized/erased under
@@ -3626,12 +3670,11 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
       const bool have_rate = (bs != 0 && t_ref > bs && dn >= bd);
       const uint64_t dd = have_rate ? (dn - bd) : 0;
       const uint64_t dt = have_rate ? (t_ref - bs) : 0;
+      // ⛔ SEMANTICS UNCHANGED from before the counters were added; only the three branches are
+      // now COUNTED. `rho/d == rate` in the first two, so `d` cancels; it survives only in the
+      // clamp and the no-rate branch.
       double rho = 1.0;
       if (d == 0) {
-        // ⛔ `d` UNKNOWN is NEVER `d == 0`: that would price this ring's T_q at zero, i.e. FREE,
-        // and Phi would pile every stream onto it. The only sound bound on an unmeasured `d` is
-        // rho <= 1, i.e. d <= 1/rate, so impute d := 1/rate -- which makes rho exactly 1. It
-        // over-prices, hence spreads, hence is safe under CLAIM S.
         if (!have_rate || dd == 0) {
           ++c.n_unk;
           continue;  // nothing measurable at all; do not invent a contribution
@@ -3641,11 +3684,26 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
           ++c.n_unk;
           continue;
         }
+        // ⛔⛔ THIS BRANCH IS UNREACHABLE, and the counter is here to keep proving it. A stream has
+        // a rate base IFF it has had a `d` sample: `phi_ep_cur_start_` is written ONLY by
+        // PhiNoteWindow, which is called ONLY from PhiSampleDuration. So `d == 0` implies no
+        // samples implies no base implies `!have_rate`, and control never reaches here -- it exits
+        // via `n_unk` above. MEASURED n_imput = 0 in every run. The "impute d := 1/rate" design note
+        // describes a path that does not execute; do not cite it as live behaviour.
+        ++c.n_imput;
       } else if (have_rate) {
         const double r = static_cast<double>(dd) / static_cast<double>(dt);
         rho = r * static_cast<double>(d);
-        if (rho > 1.0) rho = 1.0;  // rho is an occupancy fraction; estimator noise can exceed it
+        if (rho > 1.0) {
+          rho = 1.0;
+          ++c.n_clamp;  // ⭐ contribution becomes 1/d -- one of only two paths where `d` decides
+        }
         if (rho < 0.0) rho = 0.0;
+      } else {
+        // ⚠️ Near-unreachable for the same reason inverted: `d != 0` implies a base exists, so this
+        // needs `t_ref <= base_start` or a torn pair -- and the seqlock closed the tear.
+        // MEASURED n_norate = 0. Kept as a live check on that reasoning.
+        ++c.n_norate;
       }
       const double dd_f = static_cast<double>(d);
       c.Tw += rho * dd_f;
@@ -3667,6 +3725,7 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     if (phi_hdr_ != nullptr) phi_hdr_->sel_n = ei + 1;
     PhiSelRec& e = phi_sel_buf_[ei % kPhiTraceSel];
     e = PhiSelRec{};
+    e.t_ref = t_ref;
     e.seq = seq;
     e.stock = (stock_choice != nullptr) ? stock_choice->id : 0;
     e.eval_w = e.eval_u = 0;
@@ -3766,8 +3825,12 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     return;
   }
   const uint64_t si = phi_trace_sel_n_.fetch_add(1, std::memory_order_relaxed);
+  if (phi_slot_buf_ != nullptr && (si % phi_snap_every_) == 0) {
+    PhiTraceSnapshot(t_ref);
+  }
   if (phi_hdr_ != nullptr) phi_hdr_->sel_n = si + 1;  // published as we go, not at teardown
   PhiSelRec& r = phi_sel_buf_[si % kPhiTraceSel];
+  r.t_ref = t_ref;
   r.seq = seq;
   r.stock = stock_id;
   r.phi_w = eval_w ? cands[best_w].q->id : 0;
@@ -3791,6 +3854,9 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     qr.q = c.q->id;
     qr.n = c.n;
     qr.n_unk = c.n_unk;
+    qr.n_imput = static_cast<uint8_t>(c.n_imput > 255 ? 255 : c.n_imput);
+    qr.n_clamp = static_cast<uint8_t>(c.n_clamp > 255 ? 255 : c.n_clamp);
+    qr.n_norate = static_cast<uint8_t>(c.n_norate > 255 ? 255 : c.n_norate);
     qr.rc = c.rc;
     qr.ded = c.ded;
     qr.Tw = static_cast<float>(c.Tw);
