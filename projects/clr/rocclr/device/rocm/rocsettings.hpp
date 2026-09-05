@@ -45,8 +45,11 @@ class Settings : public device::Settings {
       //! DEBUG_HIP_DYNAMIC_QUEUES=4 silently reads as 0 (off) with no diagnostic. Do not
       //! reproduce that here: a mode that silently degrades to a stock baseline is
       //! indistinguishable from a working control.
-      uint queue_phi_ : 2;
-      uint reserved_ : 15;
+      //! ⛔ WIDENED 2 -> 3 BITS for the live mode. At 2 bits `DEBUG_CLR_QUEUE_PHI=4` would have
+      //! stored as 0, i.e. silently STOCK -- exactly the failure the note above describes for
+      //! `dynamic_queues_`. The clamp in rocsettings.cpp must stay <= (1 << width) - 1.
+      uint queue_phi_ : 3;
+      uint reserved_ : 14;
     };
     uint value_;
   };

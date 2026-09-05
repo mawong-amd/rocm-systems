@@ -753,6 +753,20 @@ class Device : public NullDevice {
   //! ns, i.e. it would be a ~30% observer effect if it were always on.
   bool PhiTimed() const { return PhiActive() && settings().queue_phi_ >= 3; }
 
+  //! ⭐⭐⭐ LIVE (`DEBUG_CLR_QUEUE_PHI=4`): the policy actually DECIDES placement rather than only
+  //! recording what it would have decided. **DEFAULT OFF, and every behaviour change gates on this
+  //! and nothing else.**
+  //! ⛔⛔ WHY THE GATE IS NON-NEGOTIABLE: `P0` (our runtime at `queue_phi_ == 0`), not stock, is the
+  //! valid baseline for everything this campaign measures. If any of these changes fired
+  //! unconditionally, P0 would stop being a control and we would lose the only clean comparison we
+  //! have. Two of the three below also change release/re-acquire CHURN, which would perturb the
+  //! shadow measurement they exist to improve.
+  //! ⭐ THE DESIGN RULE THIS SERVES: every placement decision goes through the policy unless the
+  //! policy cannot answer for CORRECTNESS or PHYSICS reasons. A hardcoded bypass that encodes
+  //! neither is a decision taken away from the policy for a reason the policy could have priced --
+  //! the same error as pricing migration at infinity.
+  bool PhiLive() const { return PhiActive() && settings().queue_phi_ >= 4; }
+
   //! Returns true if PM4 emulation is enabled
   bool IsPm4Emulation() const { return pm4_emulation_; }
 

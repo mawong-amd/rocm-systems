@@ -2573,7 +2573,24 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
 
   // Skip the pending dispatch only when both conditions are met: a completion
   // signal tracks the last packet and the fence is already clean (system scope).
-  if (finalLastSlot->completion_signal.handle != 0 && !isFenceDirty()) {
+  // ⭐⭐ ITEM C, LIVE ONLY -- and this closes a REACHABLE hole, not a hypothetical one.
+  // `completion_signal.handle != 0` is true for a pre-patched graph tail, because it carries the
+  // GRAPH's own HW event. But that signal is not TRACKER-owned, so `TrackQueueProgress` below is
+  // called with `skip_signal = pre_patched` and leaves `last_packet_with_signal_index_` behind
+  // `last_write_index_` => `IsQueueIdle()` is false. Clearing `hasPendingDispatch_` here then
+  // removes the one thing that would have fixed it: `releaseGpuMemoryFence` (`:2804`) emits the
+  // restoring barrier only if `hasPendingDispatch_ || isFenceDirty() || external signals`, and the
+  // system-scope branch a few lines up (`:2235`) has already cleared the fence-dirty disjunct.
+  // ⇒ the stream becomes UNRELEASABLE until some later marker/finish/barrier happens by.
+  // TRACED, and it is gated on the tail's RELEASE SCOPE: reachable only when `lastHeader` carries a
+  // SYSTEM-scope release (so `:2235` clears fence-dirty) AND the tail has a pre-patched signal. For
+  // any other scope `setFenceDirty(true)` at `:2224` survives and the next fence restores
+  // provability -- which is why release was observed working "every round" in the probes.
+  // ⛔ It fails CONSERVATIVE (we lose a placement decision, we never take a wrong one), which is why
+  // stock keeps it. Under `PhiLive()` we would rather have the decision.
+  const bool tail_signal_is_tracker_owned = !pre_patched;
+  if (finalLastSlot->completion_signal.handle != 0 && !isFenceDirty() &&
+      (tail_signal_is_tracker_owned || !dev().PhiLive())) {
     hasPendingDispatch_ = false;
   }
 
@@ -3241,8 +3258,23 @@ void VirtualGPU::ReleaseAllHwQueues() {
 
 // ================================================================================================
 void VirtualGPU::ReleaseHwQueue() {
-  // Dedicated queues and pinned graph queues keep their HW queue
-  if (dedicated_queue_ || queue_pinned_) {
+  // Dedicated queues keep their HW queue.
+  // ⭐⭐ ITEM F, LIVE ONLY: `queue_pinned_` does NOT veto a release under the policy.
+  // ⛔ THE PIN IS NOT THE CORRECTNESS GUARANTEE -- the `IsQueueIdle()` DRAIN PROOF below is. A
+  // drained queue has REALISED what `BuildSyncPlan` only PROMISED, which subsumes every ordering
+  // PASS 1 and PASS 2 elide, so a released graph stream has no in-flight work and no dependency can
+  // be lost. Release is drain-gated, so this cannot move a stream mid-flight.
+  // ⛔ The pin is also ALREADY INCONSISTENT: `ReacquireQueueExcluding` ignores it entirely and
+  // releases unconditionally. A flag honoured here and silently bypassed there was never a
+  // guarantee, and correctness must not be built on it.
+  // ⭐ Its real content is a PERFORMANCE preference -- PR #5031's "so dynamic queue management
+  // won't release it between launches", with Motivation/Technical-Details/JIRA all empty template
+  // stubs and ordering never mentioned. That is exactly the kind of preference the policy should
+  // price rather than have imposed on it.
+  // ⇒ With the pin in force, graph streams are the ONE population excluded from placement, and they
+  // are the population whose first binding is chosen at capture where ~50% of acquires see a free
+  // ring and ~40% are ties -- i.e. chosen with almost no information and then frozen.
+  if (dedicated_queue_ || (queue_pinned_ && !dev().PhiLive())) {
     return;
   }
 

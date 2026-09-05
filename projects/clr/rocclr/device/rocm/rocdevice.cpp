@@ -4013,7 +4013,19 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
     }
     // Best-effort preferred queue hint: for graph stream stability
     // Skip preferred if it's in the excluded set
-    if (preferred != nullptr) {
+    // ⭐⭐ ITEM B, LIVE ONLY. The preferred-queue hint returns a ring WITHOUT EVALUATING ANY METRIC,
+    // so it is a placement decision the policy never sees. That is not a correctness constraint and
+    // not physics -- its justification is PR #5031's stream stability across launches, which is a
+    // performance preference the policy can price: preferring the incumbent ring IS a migration-cost
+    // term, and `C_migrate` is currently 0 by explicit decision.
+    // ⛔ Under `PhiLive()` we do NOT take the bypass. The hinted queue is still in `queuePool_`, so
+    // it remains a candidate and WINS whenever the metric agrees -- which per #5031's own claim is
+    // most of the time. Stability is preserved on the merits instead of by fiat.
+    // ⚠️ MEASURED, and it is why this is worth doing at all: the bypass is 45% of graph
+    // re-acquisitions in the toy probes but **0 of ~1,300 in-workload production decisions** in all
+    // three v3 arms (0.9% whole-lifetime, a startup phenomenon). So expect this to change little in
+    // DSV4 and a great deal in the probes -- do not read a probe delta as a production result.
+    if (preferred != nullptr && !PhiLive()) {
       bool preferred_excluded = excluded_ids && excluded_ids->count(preferred->id) > 0;
       if (!preferred_excluded) {
         auto it = queuePool_[qIndex].find(preferred);

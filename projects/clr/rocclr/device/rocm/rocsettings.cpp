@@ -90,8 +90,11 @@ Settings::Settings() {
   // truncates to 0 and presents as a clean stock baseline, which is worse than an error.
   {
     const uint32_t requested = DEBUG_CLR_QUEUE_PHI;
-    // 0 off / 1 estimator only / 2 SHADOW (decide, log, do not act) / 3 live.
-    const uint32_t clamped = std::min(requested, 3u);
+    // 0 off / 1 estimator only / 2 SHADOW (decide, log, do not act) / 3 shadow + self-timed /
+    // 4 LIVE (the policy actually decides placement).
+    // ⛔ The old comment here said "3 live" while `PhiTimed()` documented 3 as shadow+timer. The
+    // two spellings had drifted and NOTHING implemented live. Fixed rather than preserved.
+    const uint32_t clamped = std::min(requested, 4u);
     if (requested != clamped) {
       ClPrint(amd::LOG_WARNING, amd::LOG_INIT,
               "DEBUG_CLR_QUEUE_PHI=%u is out of range; clamped to %u", requested, clamped);
