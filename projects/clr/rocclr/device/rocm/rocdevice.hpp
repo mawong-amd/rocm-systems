@@ -742,8 +742,26 @@ class Device : public NullDevice {
   //! purpose: a declined-regime run must still emit its `T313PHI ... declined_regime=` readout,
   //! which is the only way to learn that it declined. Those sites act on nothing. Every site that
   //! CHANGES BEHAVIOUR or SCORES must ask PhiActive()/PhiShadow()/PhiUnbypassed() and nothing else.
+  //! ⛔ DEDICATED QUEUES PUT US OUT OF REGIME, AND WE DECLINE RATHER THAN MODEL THEM.
+  //! `dedicated_queue` is set only when `queue->isDedicatedQueue() && dynamic_queues_ >= 2`
+  //! (rocdevice.cpp:2047) -- i.e. an OPTIONAL feature, off at the default of 1, for the null
+  //! stream. MEASURED: `hasDedicatedQueue_` is set in **0 of 589,484** production candidate
+  //! records, because the feature is off by configuration, not because it is rare.
+  //! ⛔ Stock prices it with `dedicated_queue_penalty = 2048`, and that is NOT a veto: the ring is
+  //! `ROC_AQL_QUEUE_SIZE` = 16384 packets, so `depth << 4` reaches 262144. The constant is a
+  //! deliberately calibrated CROSSOVER -- its own comment says "use dedicated if regular queues
+  //! have depth > ~128 packets". Φ prices DUTY, not queue occupancy, so it has no honest analogue
+  //! and inventing one would be the `C_migrate = inf` mistake in a new place: encoding a tuned
+  //! threshold as a number we cannot defend.
+  //! ⇒ Decline the whole REGIME, exactly as we decline `cap > numHwPipes_`. We make no guarantees
+  //! about a mode we do not run and have never measured. A per-decision fallback was considered and
+  //! rejected: it would mix Φ and stock decisions inside one trace and add a path that never
+  //! executes in production, i.e. one more branch that cannot be tested where it matters.
+  //! ⭐ Φ is therefore defined for `dynamic_queues_ == 1` exactly (`queue_phi_` is already forced to
+  //! 0 when `dynamic_queues_ == 0`, in rocsettings.cpp).
   bool PhiActive() const {
-    return settings().queue_phi_ != 0 && settings().max_hw_queues_ <= numHwPipes_;
+    return settings().queue_phi_ != 0 && settings().max_hw_queues_ <= numHwPipes_ &&
+           settings().dynamic_queues_ < 2;
   }
 
   //! ⭐ SHADOW: evaluate the policy and LOG what it would have chosen, changing nothing. This is

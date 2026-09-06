@@ -732,10 +732,12 @@ bool Device::create() {
   // actionable without re-deriving the predicate.
   if (settings().queue_phi_ != 0 && !PhiActive()) {
     ClPrint(amd::LOG_WARNING, amd::LOG_INIT,
-            "DEBUG_CLR_QUEUE_PHI=%u is INACTIVE on this device: the policy is defined only for "
-            "cap <= pipes and GPU_MAX_HW_QUEUES=%u > numHwPipes=%u. Behaviour is identical to "
-            "DEBUG_CLR_QUEUE_PHI=0; no shadow trace will be written.",
-            settings().queue_phi_, settings().max_hw_queues_, numHwPipes_);
+            "DEBUG_CLR_QUEUE_PHI=%u is INACTIVE on this device. The policy needs "
+            "GPU_MAX_HW_QUEUES (%u) <= numHwPipes (%u) AND DEBUG_HIP_DYNAMIC_QUEUES (%u) == 1; "
+            "at >= 2 dedicated queues exist and Phi declines the regime rather than model them. "
+            "Behaviour is identical to DEBUG_CLR_QUEUE_PHI=0; no shadow trace will be written.",
+            settings().queue_phi_, settings().max_hw_queues_, numHwPipes_,
+            settings().dynamic_queues_);
   }
 
   // ⛔ ALLOCATE THE SHADOW TRACE HERE, NOT LAZILY ON THE DECISION PATH. The lazy `resize()` ran on
