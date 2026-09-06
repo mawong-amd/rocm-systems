@@ -91,12 +91,18 @@ Settings::Settings() {
   {
     const uint32_t requested = DEBUG_CLR_QUEUE_PHI;
     // ⛔ THE LADDER IS DEFINED ONCE, IN rocdevice.hpp
-    // (`PhiActive`/`PhiShadow`/`PhiTimed`/`PhiUnbypassed`). Do NOT restate it here -- the restatement in
+    // (`PhiActive`/`PhiShadow`/`PhiTimed`/`PhiUnbypassed`/`PhiDecides`). Do NOT restate it here -- the
+    // restatement in
     // this file said "3 live" while `PhiTimed()` said 3 = shadow+timer and nothing implemented
     // live at all, and rocsettings.hpp carried a THIRD spelling. Three printers, one meaning.
     // The only thing this site owns is the numeric ceiling, which must equal the highest mode
-    // those predicates test (`PhiUnbypassed()`: >= 4) and stay <= (1 << 3) - 1.
-    const uint32_t clamped = std::min(requested, 4u);
+    // those predicates test (`PhiDecides()`: >= 5) and stay <= (1 << 3) - 1.
+    // ⛔ BUMPED 4 -> 5 WITH `PhiDecides()`. This ceiling and the highest predicate must move
+    // together: leave it at 4 and `DEBUG_CLR_QUEUE_PHI=5` stores as 4, i.e. SILENTLY MODE 4 --
+    // a run that looks like the selector and is actually the control. Same shape as the 2-bit
+    // field that stored mode 4 as 0 (silently stock); that trap is documented in rocsettings.hpp
+    // and must not be reintroduced one rung higher.
+    const uint32_t clamped = std::min(requested, 5u);
     if (requested != clamped) {
       ClPrint(amd::LOG_WARNING, amd::LOG_INIT,
               "DEBUG_CLR_QUEUE_PHI=%u is out of range; clamped to %u", requested, clamped);

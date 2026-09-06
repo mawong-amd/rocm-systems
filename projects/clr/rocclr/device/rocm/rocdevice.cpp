@@ -3501,7 +3501,18 @@ bool Device::PhiTraceMapOpen() const {
   // reader fails loudly rather than quietly -- but dispatch on the version anyway.
   // ⭐ `PhiSelRec::cands` still counts RANKABLE candidates only, and excluded records are flagged,
   // so filtering on the flag reproduces v3's numbers exactly.
-  phi_hdr_->version = 5;
+  // ⛔⛔ VERSION 6, AND IT IS THE v2->v3 SHAPE AGAIN -- THE DANGEROUS ONE. `PhiSelRec` grew
+  // `int8_t chooser` + `pad_[1]` out of what was compiler PADDING, so `sizeof(PhiSelRec)` is
+  // UNCHANGED at 72 B and every existing offset still parses. A v5 reader therefore reads a v6
+  // file without error and a v6 reader reads a v5 file and finds `chooser` = whatever bytes the
+  // ring's previous occupant left there -- which for v5 files is never-written padding, i.e.
+  // exactly the v1 `n_imput` trap (MEASURED 6563/6563 stale zeros reported as a confident
+  // measurement). ⇒ READERS MUST REFUSE TO REPORT `chooser` BELOW VERSION 6. Not print 0.
+  // ⭐ v6 also carries the mode-5 selector: at `DEBUG_CLR_QUEUE_PHI=5` the queue RETURNED by
+  // `getQueueFromPool` is `phi_w`, not `stock`. `stock` and `phi_w` are both still recorded on
+  // every decision, so `agree_w` keeps its v5 meaning ("Phi_w's pick == stock's pick") and
+  // `chooser` -- and only `chooser` -- says which was applied.
+  phi_hdr_->version = 6;
   phi_hdr_->sel_cap = kPhiTraceSel;
   phi_hdr_->selq_cap = kPhiTraceSelQ;
   phi_hdr_->sel_n = 0;
@@ -3576,11 +3587,18 @@ void Device::PhiTraceDump() const {
     const PhiSelRec& r = phi_sel_buf_[i % kPhiTraceSel];
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
             "T313SEL seq=%lu via=%s cands=%u free=%u meas=%u mult_w=%u mult_u=%u eval_w=%d "
-            "eval_u=%d stock=%lu phi_w=%lu phi_u=%lu agree_w=%d agree_u=%d wu_same=%d",
+            // ⛔ TWO PRINTERS, ONE FORMAT -- the FIFTH recurrence in this campaign, and this is
+            // the other emitter of PhiSelRec (the binary sink is in PhiShadowReport). `chooser` is
+            // the field that says whether Phi DROVE the decision; omitting it here would make
+            // heap-ring mode -- which is every toy probe without DEBUG_CLR_PHI_TRACE -- unable to
+            // tell mode 5 from mode 4 at all. That is precisely how the `d`-path counters were
+            // invisible to every probe run.
+            "eval_u=%d stock=%lu phi_w=%lu phi_u=%lu agree_w=%d agree_u=%d wu_same=%d chooser=%d",
             (unsigned long)r.seq, r.via_bypass ? "bypass" : "metric", r.cands, r.n_free, r.n_meas,
             r.mult_w, r.mult_u,
             (int)r.eval_w, (int)r.eval_u, (unsigned long)r.stock, (unsigned long)r.phi_w,
-            (unsigned long)r.phi_u, (int)r.agree_w, (int)r.agree_u, (int)r.wu_same);
+            (unsigned long)r.phi_u, (int)r.agree_w, (int)r.agree_u, (int)r.wu_same,
+            (int)r.chooser);
   }
   for (uint64_t i = qdrop; i < qn; ++i) {
     const PhiSelQRec& q = phi_selq_buf_[i % kPhiTraceSelQ];
@@ -3590,10 +3608,15 @@ void Device::PhiTraceDump() const {
             // never reached this line, so heap-ring mode (every toy probe) could not see them at
             // all. `nnod` in particular is not optional here: without it `Hu`/`Tu`/`Tw` on this
             // line are aggregates of unstated arity.
+            // ⛔ `excl` was added to the struct at v4 and never reached THIS printer -- the same
+            // omission as `nnod`, one version later. Without it a heap-ring reader cannot tell a
+            // ranked candidate from a recorded-but-unrankable one, and every per-ring aggregate it
+            // computes is over the wrong set.
             "T313SELQ seq=%lu q=%lu n=%u nunk=%u nnod=%u nclamp=%u nnorate=%u rc=%u ded=%u "
-            "Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
+            "excl=%u Tw=%.1f Hw=%.9f Tu=%.1f Hu=%.9f",
             (unsigned long)q.seq, (unsigned long)q.q, q.n, q.n_unk, (unsigned)q.n_nod,
             (unsigned)q.n_clamp, (unsigned)q.n_norate, q.rc, (unsigned)q.ded,
+            (unsigned)q.excluded,
             (double)q.Tw, (double)q.Hw, (double)q.Tu, (double)q.Hu);
   }
 }
@@ -3661,7 +3684,12 @@ void Device::PhiTraceSnapshot(uint64_t t_ref) const {
 // other.
 void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
                              const std::unordered_set<uint64_t>* excluded_ids,
-                             bool via_bypass) const {
+                             bool via_bypass,
+                             const hsa_queue_t** phi_choice_out) const {
+  // ⛔ FIRST STATEMENT. Every `return` below is then a "Phi has no opinion" answer by default, and
+  // no path can leave the caller reading an uninitialised pointer and binding to garbage. The
+  // failure mode this forbids is silent and catastrophic; the guard is free.
+  if (phi_choice_out != nullptr) *phi_choice_out = nullptr;
   // ⭐ ONE common right edge for every stream. A per-stream edge makes an IDLE stream's window
   // short and its rate look HIGH, which is backwards.
   // ⭐ Slots publish the rate BASE, not a finished rate, precisely so this edge is applied here and
@@ -3869,6 +3897,10 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
     e.eval_w = e.eval_u = 0;
     e.agree_w = e.agree_u = e.wu_same = -1;
     e.via_bypass = via_bypass ? 1 : 0;
+    // ⛔ -1, NOT 0. `chooser == 0` means "stock's pick was applied", which is a positive claim.
+    // Here there was no ranking at all, so the honest value is "not applicable". `e = PhiSelRec{}`
+    // above already zeroed it, and zero is the wrong answer -- this is the fix, not decoration.
+    e.chooser = -1;
     note_cost();
     return;
   }
@@ -3970,6 +4002,27 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   // ⛔ Against `n_rank`, NOT `cands.size()`: "everything ties" means every RANKABLE candidate ties.
   const bool eval_w = mult_w < n_rank;
   const bool eval_u = mult_u < n_rank;
+  // ================================ THE DECISION ==================================================
+  // ⭐⭐⭐ `DEBUG_CLR_QUEUE_PHI=5`: this is the whole payload of the campaign. Everything above is
+  // the ranking that has been computed and thrown away since mode 2; the only new thing is that the
+  // caller is now told the answer and acts on it.
+  // ⛔ HERE, NOT AFTER THE TRACE WRITE. The `phi_sel_buf_ == nullptr` return below is a lost
+  // MEASUREMENT; making the policy depend on it would make an unallocated trace silently run the
+  // control arm under the mode-5 label -- the failure this campaign has already paid for twice
+  // (`queue_phi_` truncating to 0; an env var inert for a whole round).
+  // ⛔ Phi_w ONLY. `best_u` is the rho == 1 CONTROL and MEASURED to collapse to a binding count
+  // (95.9-98.3% agreement with a pure `n`-ranking, vs 20.3-24.0% for `H_w`); driving with it would
+  // be re-implementing stock's refCount with extra steps. `phi_u` stays in the trace, unused.
+  // ⛔ `eval_w == 0` => NO OPINION => stock's pick stands. Not `cands[best_w]`: with every rankable
+  // candidate tied, `best_w` is index 0, an artefact of the pool's iteration order, and binding to
+  // it would report a tie-break as a policy decision.
+  // ⭐ NOTE WHAT IS *NOT* HERE: no `excluded_ids` filter (Phi ranks the full pool by explicit
+  // decision -- see Device::PhiDecides), no migration cost, no stay-put bias, no oscillation
+  // damper. All four are absences ON PURPOSE and each is priced in the PhiDecides comment.
+  const bool phi_decides = PhiDecides() && phi_choice_out != nullptr;
+  const int8_t chooser = (phi_decides && eval_w) ? 1 : 0;
+  if (chooser == 1) *phi_choice_out = cands[best_w].q;
+  // ================================================================================================
   const uint64_t stock_id = (stock_choice != nullptr) ? stock_choice->id : 0;
   // ⭐ Append only. No formatting, no I/O, no lock, NO ALLOCATION -- see the note on the ring in
   // the header and the eager reserve in Device::create.
@@ -4004,6 +4057,12 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   r.via_bypass = via_bypass ? 1 : 0;
   r.mult_w = mult_w;
   r.mult_u = mult_u;
+  // ⛔ This record is NOT zero-initialised (every field is assigned individually, unlike the
+  // `n_rank == 0` path above), and the ring WRAPS IN PLACE over a MAP_SHARED file. An unassigned
+  // `chooser`/`pad_` would carry the PREVIOUS occupant's bytes, which for `chooser` means a
+  // mode-2 record could read `1` and claim Phi drove a decision it did not. Write both.
+  r.chooser = chooser;
+  r.pad_[0] = 0;
   for (const auto& c : cands) {
     const uint64_t qi = phi_trace_selq_n_.fetch_add(1, std::memory_order_relaxed);
     if (phi_hdr_ != nullptr) phi_hdr_->selq_n = qi + 1;
@@ -4105,72 +4164,131 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
       }
     }
 
-    typedef decltype(queuePool_)::value_type::const_reference PoolRef;
-
     // Select queue based on dynamic_queues_ mode
-    decltype(queuePool_[qIndex].begin()) lowest;
     uint32_t mode = settings().dynamic_queues_;
 
     // gfx9XX pipe distribution: queues map to pipes via queue_id % num_pipes
     const bool pipe_dist = settings().queue_pipe_dist_;
     const uint32_t num_pipes = numHwPipes_;
 
-    lowest = std::min_element(
-        queuePool_[qIndex].begin(), queuePool_[qIndex].end(),
-        [mode, pipe_dist, num_pipes, excluded_ids](PoolRef first_candidate,
-                                                   PoolRef second_candidate) {
-          // Exclusion filtering: prefer non-excluded queues over excluded ones
-          bool first_is_excluded =
-              excluded_ids && excluded_ids->count(first_candidate.first->id) > 0;
-          bool second_is_excluded =
-              excluded_ids && excluded_ids->count(second_candidate.first->id) > 0;
-          if (first_is_excluded != second_is_excluded) return second_is_excluded;
+    // ⛔⛔ ODDITIES #4, FIXED HERE, AND IT IS A CORRECTNESS FIX NOT A TIDY-UP. The old form was
+    // `std::min_element` over a lambda that called `QueueInfo::GetLoadMetric` -> `GetHwQueueDepth`,
+    // which reads LIVE `wptr`/`rptr`. Those move asynchronously with the GPU, so the SAME candidate
+    // could compare cheaper than X and dearer than Y within one sort: an inconsistent comparator,
+    // which is formally UB, not merely imprecise. It also cost 2 depth reads per comparison.
+    // ⇒ Each candidate's cost is now SNAPSHOTTED EXACTLY ONCE and the argmin runs over snapshots.
+    // `active_queue_access_` is held, so `refCount`/`hasDedicatedQueue_` are already stable; `depth`
+    // is the only live term and it is now read once per candidate instead of once per comparison.
+    // ⛔ THIS IS A HAND-ROLLED `min_element`, ON PURPOSE, AND THE SEMANTICS MUST MATCH EXACTLY:
+    // `min_element` keeps its incumbent unless a later element is STRICTLY better, and iterates the
+    // map in ascending-`id` order (`QueueCompare`). `stock_better(c, best)` with the INCUMBENT ON
+    // THE RIGHT reproduces both. Reverse those two arguments and every tie flips to the LAST
+    // candidate instead of the first -- and ties are the common case here, so that single
+    // transposition would silently re-place most decisions while looking like a refactor.
+    // ⛔ NO VECTOR. A `std::vector` of snapshots would allocate on a path holding
+    // `active_queue_access_` -- the device-wide lock serialising every acquire AND release -- at
+    // PHI=0, i.e. it would tax the campaign's own baseline. Only the argmin is wanted, so one pass
+    // with a single live incumbent gives the identical answer with no allocation.
+    // ⚠️ NOT bit-identical to the old code when depth races; that case IS the bug. PREREG-SELECTOR
+    // P4 therefore predicts an unchanged DISTRIBUTION at modes <= 4, not bit-identity.
+    struct StockCost {
+      decltype(queuePool_[qIndex].begin()) it;
+      bool excluded;   //!< caller's `excluded_ids`: a graph sibling already holds this ring
+      bool unshared;   //!< refCount == 0 && !dedicated -- stock's top tier, above the metric
+      uint64_t cost;   //!< mode >= 1: GetLoadMetric; mode 0: refCount. Snapshotted once.
+      uint64_t pipe;   //!< id % numHwPipes_, stock's `pipe_dist` tie-break
+    };
+    const auto stock_better = [mode, pipe_dist](const StockCost& a, const StockCost& b) {
+      // Exclusion filtering: prefer non-excluded queues over excluded ones
+      if (a.excluded != b.excluded) return b.excluded;
+      // Always use an unshared regular queue before sharing an active queue. On devices
+      // with coarse-grained read pointer updates, an idle queue can retain a nonzero
+      // apparent depth and must not lose to a blocked queue with a smaller reported depth.
+      if (a.unshared != b.unshared) return a.unshared;
+      // Mode 1+: Advanced weighted metric with dedicated queue penalty
+      // Metric = dedicated_queue_penalty + (depth << 4) + refCount
+      // gfx9XX pipe distribution: on an equal metric prefer the lower pipe id.
+      // Mode 0: `cost` holds refCount and there is no tie-break, exactly as before.
+      if (mode >= 1 && a.cost == b.cost && pipe_dist) return a.pipe < b.pipe;
+      return a.cost < b.cost;
+    };
+    bool have_best = false;
+    StockCost best{};
+    for (auto it = queuePool_[qIndex].begin(); it != queuePool_[qIndex].end(); ++it) {
+      StockCost c;
+      c.it = it;
+      c.excluded = (excluded_ids != nullptr && excluded_ids->count(it->first->id) > 0);
+      c.unshared = (it->second.refCount == 0 && !it->second.hasDedicatedQueue_);
+      c.cost = (mode >= 1) ? it->second.GetLoadMetric(it->first, mode)
+                           : static_cast<uint64_t>(it->second.refCount);
+      // ⛔ Guarded. The old code only evaluated this modulo inside `if (pipe_dist)`; hoisting it
+      // unguarded would divide by zero on any device reporting no pipes.
+      c.pipe = (num_pipes != 0) ? (it->first->id % num_pipes) : 0;
+      if (!have_best || stock_better(c, best)) {
+        best = c;
+        have_best = true;
+      }
+    }
+    // ⛔ `queuePool_[qIndex].size() > 0` is the enclosing condition so this cannot fire. It exists
+    // so that if that ever changes the failure is a null return, not a wild iterator dereference.
+    if (!have_best) return nullptr;
+    auto lowest = best.it;
+    const uint64_t stock_cost = best.cost;
 
-          // Always use an unshared regular queue before sharing an active queue. On devices
-          // with coarse-grained read pointer updates, an idle queue can retain a nonzero
-          // apparent depth and must not lose to a blocked queue with a smaller reported depth.
-          bool first_is_unshared =
-              first_candidate.second.refCount == 0 &&
-              !first_candidate.second.hasDedicatedQueue_;
-          bool second_is_unshared =
-              second_candidate.second.refCount == 0 &&
-              !second_candidate.second.hasDedicatedQueue_;
-          if (first_is_unshared != second_is_unshared) return first_is_unshared;
-
-          if (mode >= 1) {
-            // Mode 1+: Advanced weighted metric with dedicated queue penalty
-            // Metric = dedicated_queue_penalty + (depth << 4) + refCount
-            uint64_t first_metric =
-                first_candidate.second.GetLoadMetric(first_candidate.first, mode);
-            uint64_t second_metric =
-                second_candidate.second.GetLoadMetric(second_candidate.first, mode);
-
-            if (first_metric == second_metric && pipe_dist) {
-              // gfx9XX pipe distribution: prefer lower pipe IDs for consistent distribution
-              uint64_t first_pipe = first_candidate.first->id % num_pipes;
-              uint64_t second_pipe = second_candidate.first->id % num_pipes;
-              return first_pipe < second_pipe;
-            }
-            return first_metric < second_metric;
-          } else {
-            // Mode 0: Simple refCount-based selection
-            return first_candidate.second.refCount < second_candidate.second.refCount;
-          }
-        });
-
-    if (PhiShadow()) {  // ⛔ BEFORE the increment -- see the note on the bypass path above.
-      PhiShadowReport(qIndex, lowest->first, excluded_ids, /*via_bypass=*/false);
+    // ⭐⭐⭐ THE PAYLOAD. `DEBUG_CLR_QUEUE_PHI=5` (`PhiDecides()`): the ring returned below is Phi's
+    // duty-weighted argmin instead of stock's. At every lower mode `phi_choice` stays null and this
+    // block reports exactly as before -- the opt-in is `PhiShadowReport`'s own `PhiDecides()` test,
+    // NOT a condition here, so there is ONE place that decides and the trace's `chooser` field
+    // cannot disagree with what actually happened.
+    // ⛔ STOCK'S PICK IS STILL COMPUTED ABOVE AT MODE 5 AND STILL PASSED AS `stock_choice`. That is
+    // what keeps `agree_w` meaning "Phi_w's pick == stock's pick" instead of degenerating into a
+    // tautology, and it is the counterfactual the offline scorer needs. Cost: one pass over <= 4
+    // map entries that we were making anyway.
+    // ⛔ BEFORE the increment -- see the note on the bypass path above. Both choosers must score the
+    // SAME instant, and the joiner must not appear in its own census.
+    // ⚠️ At mode 5 `PhiUnbypassed()` is also true, so the `preferred` bypass above never returns and
+    // every in-workload decision reaches this comparator. That is what makes MODE 4 the control for
+    // any mode-5 placement statistic -- mode 2 differs by B/C/F as well.
+    bool chose_phi = false;
+    if (PhiShadow()) {
+      const hsa_queue_t* phi_choice = nullptr;
+      PhiShadowReport(qIndex, lowest->first, excluded_ids, /*via_bypass=*/false, &phi_choice);
+      if (phi_choice != nullptr) {
+        // ⛔ `phi_choice` came from THIS pool, under THIS lock, microseconds ago, so the lookup
+        // cannot miss -- which is exactly why it is checked rather than assumed. An unfindable
+        // pointer would mean the census and the pool have diverged, and silently falling back to
+        // stock's ring would hide that divergence behind a plausible placement.
+        auto pit = queuePool_[qIndex].find(const_cast<hsa_queue_t*>(phi_choice));
+        if (pit != queuePool_[qIndex].end()) {
+          lowest = pit;
+          chose_phi = true;
+        } else {
+          ClPrint(amd::LOG_ERROR, amd::LOG_QUEUE,
+                  "T313PHI: Phi chose queue id %lu absent from pool %u -- keeping stock's pick",
+                  (unsigned long)phi_choice->id, qIndex);
+        }
+      }
     }
     lowest->second.refCount++;
+    // ⛔⛔ THIS LINE REPORTS refCount POST-INCREMENT (+1); the TRACE reports it PRE. Any
+    // "all queues occupied" figure taken from this LOG is inflated by one tenant -- that is where
+    // an earlier "246/246 at MS=0" came from. Never mix the two channels. (Behaviour unchanged;
+    // restated because the line now has a second reader.)
+    // ⚠️ `metric` is now the SNAPSHOT the choice was actually made on, not a fresh post-hoc read --
+    // the old line re-read the depth after selecting, so the number it printed was not the number
+    // that decided anything. At `chooser=phi` it is re-read on purpose: it then reports stock's
+    // cost FOR PHI'S RING, i.e. what the policy was willing to pay, which is the useful quantity.
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
-            "Selected queue (mode=%u): %p refCount: %d, depth: %lu, metric: %lu, pipe: %d%s%s",
+            "Selected queue (mode=%u): %p refCount: %d, depth: %lu, metric: %lu, pipe: %d%s%s"
+            " chooser=%s",
             mode, lowest->first->base_address, lowest->second.refCount,
             QueueInfo::GetHwQueueDepth(lowest->first),
-            lowest->second.GetLoadMetric(lowest->first, mode),
-            pipe_dist ? (lowest->first->id % num_pipes) : -1,
+            chose_phi ? lowest->second.GetLoadMetric(lowest->first, mode) : stock_cost,
+            pipe_dist ? (int)(num_pipes != 0 ? lowest->first->id % num_pipes : 0) : -1,
             force_reuse ? " (forced)" : "",
             (excluded_ids && excluded_ids->count(lowest->first->id) > 0)
-                ? " (excluded-fallback)" : "");
+                ? " (excluded-fallback)" : "",
+            chose_phi ? "phi" : "stock");
     return lowest->first;
   }
   return nullptr;

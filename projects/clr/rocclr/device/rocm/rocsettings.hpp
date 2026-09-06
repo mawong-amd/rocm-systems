@@ -40,7 +40,8 @@ class Settings : public device::Settings {
       uint ext_dispatch_packet_ : 1;   //!< Uses new ext dispatch packet for all launches
       uint aql_barrier_opt_ : 1;       //!< Per-stream barrier-bit optimization
       //! ⭐ Total-slowdown placement policy. THE LADDER IS DEFINED IN EXACTLY ONE PLACE --
-      //! `Device::PhiActive/PhiShadow/PhiTimed/PhiUnbypassed` in rocdevice.hpp. Do NOT restate it here or
+      //! `Device::PhiActive/PhiShadow/PhiTimed/PhiUnbypassed/PhiDecides` in rocdevice.hpp. Do NOT restate it
+      //! here or
       //! in rocsettings.cpp: it has already drifted into THREE spellings (this one said
       //! "0 off, 1 observe only, 2 select"; rocsettings.cpp said "3 live"; the predicates said
       //! otherwise), which is the same "two printers, one format string" failure that has bitten

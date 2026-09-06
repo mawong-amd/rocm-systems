@@ -741,7 +741,8 @@ class Device : public NullDevice {
   //! `SetGpuQueue`/`ReacquireQueueExcluding`) ask `queue_phi_ != 0` WITHOUT the regime clause, on
   //! purpose: a declined-regime run must still emit its `T313PHI ... declined_regime=` readout,
   //! which is the only way to learn that it declined. Those sites act on nothing. Every site that
-  //! CHANGES BEHAVIOUR or SCORES must ask PhiActive()/PhiShadow()/PhiUnbypassed() and nothing else.
+  //! CHANGES BEHAVIOUR or SCORES must ask PhiActive()/PhiShadow()/PhiUnbypassed()/PhiDecides() and
+  //! nothing else.
   //! ⛔ DEDICATED QUEUES PUT US OUT OF REGIME, AND WE DECLINE RATHER THAN MODEL THEM.
   //! `dedicated_queue` is set only when `queue->isDedicatedQueue() && dynamic_queues_ >= 2`
   //! (rocdevice.cpp:2047) -- i.e. an OPTIONAL feature, off at the default of 1, for the null
@@ -812,6 +813,41 @@ class Device : public NullDevice {
   //! exists to replace. That is a step towards Phi driving selection, not a policy result:
   //! **no placement number from this mode is a Phi number until Phi drives the argmin.**
   bool PhiUnbypassed() const { return PhiActive() && settings().queue_phi_ >= 4; }
+
+  //! ⭐⭐⭐ `DEBUG_CLR_QUEUE_PHI=5`. **THIS IS THE ONE THAT DECIDES.** Everything mode 4 says it is
+  //! NOT, this is. In `getQueueFromPool` the returned ring is Phi's duty-weighted argmin (`best_w`
+  //! under the `MetricKey` order) instead of `std::min_element` over `QueueInfo::GetLoadMetric`.
+  //! ⛔ IT SUBSUMES MODE 4 (`>= 4` is true here), so the three placement-freedom changes B/C/F are
+  //! ALSO on. That is deliberate: mode 4 exists precisely to be mode 5's control, differing by the
+  //! CHOOSER ALONE. ⛔ Consequently **mode 4, not mode 2 and not P0, is the control for any mode-5
+  //! placement statistic** -- a mode-2 -> mode-5 delta is confounded by B/C/F and must be labelled so.
+  //! ⛔⛔ STOCK'S PICK IS STILL COMPUTED, ON EVERY DECISION, AT EVERY MODE >= 2. It is not dead
+  //! work: it is what keeps `PhiSelRec::stock` an independent quantity, so `agree_w` means the same
+  //! thing at mode 5 as at mode 2 ("Phi_w's pick == stock's pick") instead of quietly degenerating
+  //! into "did Phi get what it asked for", which is true by construction. A field whose semantics
+  //! shift between versions is the exact trap trace v4/v5 exist to avoid. `PhiSelRec::chooser`
+  //! (v6) says which pick was APPLIED; `stock` and `phi_w` say what each chooser wanted.
+  //! ⛔ FALLBACK: `eval_w == 0` (every rankable candidate ties, all blind, or `n_rank == 0`) =>
+  //! **stock's pick is used**. Phi's argmin would otherwise return index 0, an artefact of
+  //! iteration order, and "Phi has no opinion" is a real outcome that must not be laundered into a
+  //! decision. `chooser` records the fallback so it is countable, never inferred.
+  //! ⛔ `excluded_ids` IS NOT A HARD FILTER FOR PHI, BY EXPLICIT DECISION (reversing an earlier
+  //! review): it means "a graph sibling holds this ring", and its rationale -- do not serialise the
+  //! graph's parallel streams -- is EXACTLY what `Σ T_q·H_q` prices. Upstream treats it as
+  //! best-effort, logging "Could not resolve queue collision ... (best-effort)" and continuing.
+  //! Hard-constraining Phi with it is the same category error as obeying the `last_hwq_` bypass,
+  //! which mode 4 already disables. The `excluded` flag is still RECORDED on every candidate so the
+  //! narrower scoring stays computable offline.
+  //! ⚠️ NAMED CONSEQUENCE, not to be discovered later: `ReacquireQueueExcluding` exists to move a
+  //! stream OFF a colliding ring. If Phi ranks the full pool and picks the ring the stream is
+  //! already on, that re-place is a no-op and the collision persists. Within upstream's
+  //! best-effort contract, but it makes the collision resolver ADVISORY under Phi.
+  //! ⛔ NO MIGRATION TERM AND NO DAMPER. `C_migrate := 0` by explicit scoping decision; herding is
+  //! MEASURED first (PREREG-SELECTOR P2), not damped on speculation. A constant we cannot price is
+  //! the `C_migrate = inf` mistake in a new place.
+  //! ⛔ Phi_w, NOT Phi_u. MEASURED: `H_u` collapses to a binding count (95.9-98.3% agreement with a
+  //! pure `n`-ranking) while `H_w` does not (20.3-24.0%). `phi_u` stays in the trace as the control.
+  bool PhiDecides() const { return PhiActive() && settings().queue_phi_ >= 5; }
 
   //! Returns true if PM4 emulation is enabled
   bool IsPm4Emulation() const { return pm4_emulation_; }
@@ -1087,6 +1123,28 @@ class Device : public NullDevice {
     uint64_t seq, stock, phi_w, phi_u;
     uint32_t cands, n_free, n_meas, mult_w, mult_u;
     int8_t eval_w, eval_u, agree_w, agree_u, wu_same, via_bypass;
+    //! ⛔⛔ v6, AND THE BUMP IS MANDATORY EVEN THOUGH `sizeof(PhiSelRec)` DOES NOT CHANGE. The
+    //! fields were 66 bytes rounded to 72; this byte comes out of what was compiler PADDING. That
+    //! is EXACTLY the v1/v2 failure -- a v2-layout reader parsed v1 padding at the right offset and
+    //! reported a confident zero (MEASURED 6563/6563 records read 0,0,0). A same-size layout change
+    //! is the dangerous kind, because record size cannot catch it. Readers MUST refuse version < 6
+    //! before reading this field.
+    //! ⭐ WHICH CHOOSER WAS APPLIED. `stock` and `phi_w` say what each chooser WANTED, and BOTH are
+    //! computed on every decision at every mode >= 2; this says which one the caller RETURNED.
+    //!   0 = stock's `min_element` pick was applied (every mode < 5, and mode 5's `eval_w == 0`
+    //!       fallback -- the fallback is therefore COUNTABLE, never inferred)
+    //!   1 = Phi_w's argmin was applied (mode 5, `eval_w == 1`)
+    //!  -1 = not applicable (the `n_rank == 0` census-hole record)
+    //! ⛔ IT IS SELF-REPORTED AND THEREFORE NOT PROOF THAT PHI DROVE ANYTHING. That must come from
+    //! the INDEPENDENT channel: `PhiSelQRec::rc` is stock's OWN refCount, and its +1 across
+    //! consecutive decisions attributes the binding to a ring without consulting anything Phi
+    //! writes. See PREREG-SELECTOR P3.
+    //! ⛔ `agree_w` DOES NOT CHANGE MEANING AT MODE 5 -- it is still "Phi_w's pick == stock's pick",
+    //! because stock's pick is still computed. Do not read it as "Phi got its way".
+    int8_t chooser;
+    //! ⛔ NAMED, AND WRITTEN. Same reason as `PhiSelQRec::pad_`: the ring WRAPS IN PLACE over a
+    //! MAP_SHARED file, so an unwritten byte carries the previous occupant's bytes, not zero.
+    int8_t pad_[1];
   };
   //! ⭐ `rc`/`ded` are stock's OWN view of the same candidate at the same instant (read before the
   //! refCount increment). They are here so the shadow census can be validated IN BAND: `n` is what
@@ -1242,9 +1300,25 @@ class Device : public NullDevice {
   //! metric) from the comparator path. Without it the two are indistinguishable in the trace, and
   //! a policy that only replaces the comparator would look effective while never running on the
   //! path that matters.
+  //! ⭐ RANKS AND REPORTS. `phi_choice_out`, when non-null, receives Phi_w's argmin -- the pool
+  //! entry the policy would bind to -- or `nullptr` when Phi has NO OPINION (`eval_w == 0`, or
+  //! `n_rank == 0`). ⛔ `nullptr` is the "no opinion" signal and the caller MUST fall back to
+  //! stock's pick on it; treating it as an error, or substituting index 0, launders a tie into a
+  //! decision.
+  //! ⛔⛔ THE `chooser` FIELD IS DECIDED HERE, NOT BY THE CALLER, and passing `phi_choice_out` is
+  //! the caller's ONLY way to opt in. If the caller could pass its own `chooser` the trace could
+  //! disagree with what actually happened -- an unfalsifiable self-report. One writer, one meaning.
+  //! `*phi_choice_out` is non-null IFF `PhiDecides() && eval_w`, which is exactly `chooser == 1`.
+  //! ⛔ It is written BEFORE the `phi_sel_buf_ == nullptr` early return: an unallocated TRACE must
+  //! not silently switch the POLICY off. Losing the trace is a lost measurement; losing the policy
+  //! while the mode says it is on is a run that reports the wrong arm.
+  //! ⛔ The function itself still changes nothing: it is `const`, it mutates no queue state, and it
+  //! is the CALLER (`getQueueFromPool`, at `PhiDecides()` only) that acts on the returned pointer.
+  //! Keeping the act separate from the ranking is what lets modes 2-4 share this exact code path.
   void PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
                        const std::unordered_set<uint64_t>* excluded_ids,
-                       bool via_bypass) const;
+                       bool via_bypass,
+                       const hsa_queue_t** phi_choice_out = nullptr) const;
 
   hsa_queue_t* getQueueFromPool(const uint qIndex, bool force_reuse = false,
                                 hsa_queue_t* preferred = nullptr,
