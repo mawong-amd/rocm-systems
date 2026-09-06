@@ -1570,9 +1570,15 @@ void VirtualGPU::SetGpuQueue(hsa_queue_t* queue) {
 }
 
 // ================================================================================================
-void VirtualGPU::AcquireHwQueueIfNeeded() {
+void VirtualGPU::AcquireHwQueueIfNeeded(hsa_queue_t* preferred) {
   if (!dedicated_queue_ && gpu_queue_ == nullptr) {
-    SetGpuQueue(roc_device_.AcquireActiveQueue(priority_, last_hwq_));
+    // ⭐ `preferred` is whatever the CALLER asked for -- NOT `last_hwq_`. See the header comment:
+    // the hint is a metric-free bypass in `getQueueFromPool`, so taking it implicitly made every
+    // caller a sticky placement decision it never asked to make.
+    SetGpuQueue(roc_device_.AcquireActiveQueue(priority_, preferred));
+    // ⭐ The hint is CONSUMED on any successful acquire, preference or not. A hint that survives
+    // an acquire is a hint for a ring this stream has already left, and it would then be applied
+    // to the NEXT acquire. Keep this unconditional; it is orthogonal to `preferred`.
     last_hwq_ = nullptr;
     if (gpu_queue_ == nullptr) {
       LogError("Runtime failed to acquire a HW queue!");
@@ -1583,9 +1589,12 @@ void VirtualGPU::AcquireHwQueueIfNeeded() {
 // ================================================================================================
 void VirtualGPU::AcquireQueueWithPreference() {
   std::scoped_lock lock(execution());
-  // Graph launch: only reattach when a preferred queue was actually saved by SetPreferredQueue().
+  // Graph launch: only reattach when a preferred queue was actually saved by SetPreferredQueue()
+  // or by the drain-gated release in ReleaseHwQueue(). This is the ONE call site that wants
+  // stickiness -- PR #5031's graph stream stability across launches -- so it is the one site that
+  // passes a preference, explicitly.
   if (last_hwq_ != nullptr) {
-    AcquireHwQueueIfNeeded();
+    AcquireHwQueueIfNeeded(last_hwq_);
   }
 }
 
@@ -1640,7 +1649,12 @@ bool VirtualGPU::ReacquireQueueExcluding(const std::unordered_set<uint64_t>& exc
 // ================================================================================================
 uint64_t VirtualGPU::getQueueID() {
   std::scoped_lock lock(execution());
-  AcquireHwQueueIfNeeded();
+  // ⭐ NO PREFERENCE. This is a query that happens to force a binding; it has no stickiness intent.
+  // ⛔ Note the graph callers in particular: `GraphExecBase::CreateStreams`/`UpdateStreams` read
+  // this to build `used_qids` and then call `ReacquireQueueExcluding()` to break collisions. A
+  // preference here would re-bind to the incumbent -- possibly colliding -- ring for free, i.e. it
+  // would work against the collision resolver that is about to run.
+  AcquireHwQueueIfNeeded(/*preferred=*/nullptr);
   return gpu_queue_->id;
 }
 
@@ -3051,7 +3065,9 @@ VirtualGPU::~VirtualGPU() {
 
   if (tracking_created_) {
     std::scoped_lock l(execution());
-    AcquireHwQueueIfNeeded();
+    // ⭐ NO PREFERENCE. Teardown needs *a* queue to drive the final fence, not a particular one --
+    // this stream is about to stop existing, so ring affinity has nothing left to buy.
+    AcquireHwQueueIfNeeded(/*preferred=*/nullptr);
     // Windows requires an interrupt in more cases than Linux for OS fence updates
     force_irq_ = IS_WINDOWS;
     // Force extra barrier to make sure OS gets an interrupt,
@@ -3429,35 +3445,26 @@ void releaseSdmaProfiling() {
  */
 void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
   // Dedicated queues keep their HW queue, never acquire from pool.
-  // ⭐ Use the shared helper instead of inlining the acquire. The guard here was already
-  // character-for-character `AcquireHwQueueIfNeeded()`'s, but the inlined body differed in two ways
-  // that matter to placement:
-  //   * it passed NO preferred queue, discarding the `last_hwq_` hint on a path that reacquires
-  //     after an idle release, so a stream that would have returned to its previous ring was
-  //     instead re-ranked from scratch;
-  //   * it never cleared `last_hwq_`, so the STALE hint survived into the NEXT acquire and was
-  //     applied there -- a preference for a queue this stream had already left.
-  //     `AcquireHwQueueIfNeeded` consumes it (`last_hwq_ = nullptr`) precisely so it cannot be.
-  // ⛔⛔ THIS ONE IS UNCONDITIONAL -- IT MOVES `P0`. It is NOT gated on `PhiUnbypassed()`, so at
-  // `queue_phi_ == 0` this path now supplies `last_hwq_` as `preferred`, which in
-  // `getQueueFromPool` takes the METRIC-FREE bypass. P0 measured before this commit and P0 measured
-  // after it are DIFFERENT CONTROLS, with no symptom to distinguish them, and every P0-anchored
-  // comparison this campaign holds predates it.
-  // ⚠️ It also interacts with item B in the direction that inflates the effect: B removes the same
-  // bypass under `PhiUnbypassed()`, so this commit pushes P0 TOWARD hint-stability at the same time as
-  // PHI=4 removes it. A P0-vs-PHI4 delta measured across this boundary conflates the two.
-  // ⇒ RE-BASELINE P0 AT THIS TIP AND PRE-REGISTER IT before quoting any P0-vs-PHI4 number.
-  // (The stale-hint half of the fix -- clearing `last_hwq_` -- is a genuine defect fix and should
-  // stay unconditional; only the passing of the preference changes placement, and the helper does
-  // both. Splitting them would reintroduce the stale hint, so the answer is to re-baseline, not to
-  // gate.)
-  // `submitMarker` already calls the helper; `dispatchGenericAqlPacket` acquires nothing and relies
-  // on its callers. This makes the "ensure a queue" idiom uniform across the paths that have one,
-  // and adds the failure log the inlined copy lacked.
+  // ⭐ Use the shared helper instead of inlining the acquire: the guard here was already
+  // character-for-character the helper's, and the helper adds the failure log the inlined copy
+  // lacked and consumes the stale `last_hwq_` hint the inlined copy left behind.
+  // ⛔⛔ BUT WITH NO PREFERENCE, EXPLICITLY. This is the DOMINANT acquire path in a HIP workload --
+  // every profiled command, every marker, every event record reaches it -- and it acquires only
+  // after a drain-gated release, where the migration cost is ~0. Handing it `last_hwq_` makes it
+  // take the metric-free `preferred` bypass in `getQueueFromPool`, i.e. it re-binds to the
+  // incumbent ring without ever consulting the load metric.
+  // ⚠️ MEASURED, and this is why the argument is not theoretical: when commit `b00b0ae049` routed
+  // this site through the then-implicit form of the helper, the bypass went from 0.9% to 97.0% of
+  // all decisions at `DEBUG_CLR_QUEUE_PHI=2`. Stock placement became sticky, ungated, as a side
+  // effect of an idiom cleanup. Passing no preference restores the metric here.
+  // ⭐ The stale-hint half of that commit is KEPT: the helper still clears `last_hwq_` on any
+  // acquire, so a hint for a ring this stream has left cannot be applied to a later acquire.
+  // PR #5031's graph stickiness is unaffected -- `ReleaseHwQueue()` re-establishes the hint on
+  // every drain-gated release, and `AcquireQueueWithPreference()` is the site that consumes it.
   // ⛔ Deliberately NOT adding a bare `gpu_queue_ == nullptr` guard to the flat batch path: no
   // sibling dispatch path has one, and an unreachable check is indistinguishable from one that
   // passes. Follow the idiom rather than hardening one path in isolation.
-  AcquireHwQueueIfNeeded();
+  AcquireHwQueueIfNeeded(/*preferred=*/nullptr);
   // Track the current command
   command_ = &command;
 
@@ -5844,7 +5851,9 @@ void VirtualGPU::submitKernel(amd::NDRangeKernelCommand& vcmd) {
       std::scoped_lock lock(execution());
 
       // Dynamic queues may have reclaimed an idle stream's HW queue; reacquire before the fence.
-      AcquireHwQueueIfNeeded();
+      // ⭐ NO PREFERENCE. The reacquired queue is only used to drain this stream before the work
+      // moves to the device's cooperative queue, so which ring it lands on carries no intent.
+      AcquireHwQueueIfNeeded(/*preferred=*/nullptr);
       if (gpu_queue_ == nullptr) {
         vcmd.setStatus(CL_INVALID_OPERATION);
         return;
@@ -5985,7 +5994,9 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
     force_irq_ = IS_WINDOWS;
     // It should be safe to call flush directly if there are not pending dispatches without
     // HSA signal callback
-    AcquireHwQueueIfNeeded();
+    // ⭐ NO PREFERENCE, for the same reason as `profilingBegin`: a CPU-wait marker is "ensure this
+    // stream has a queue", not "put this stream back where it was".
+    AcquireHwQueueIfNeeded(/*preferred=*/nullptr);
     flush(vcmd.GetBatchHead());
     SetCoalesceWindow(0, nullptr);
   } else {

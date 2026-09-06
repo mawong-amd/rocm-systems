@@ -626,10 +626,28 @@ class VirtualGPU : public device::VirtualDevice {
   //! Set the active HW queue and keep the metadata preloader in sync.
   void SetGpuQueue(hsa_queue_t* queue);
 
-  //! Ensure a HW queue is held, acquiring one (with the last_hwq_ affinity hint) if a
-  //! dynamic-queue reclaim released it. No-op for dedicated queues or when one is already held.
-  //! Caller must hold the execution() lock.
-  void AcquireHwQueueIfNeeded();
+  //! Ensure a HW queue is held, acquiring one if a dynamic-queue reclaim released it.
+  //! No-op for dedicated queues or when one is already held. Caller must hold execution().
+  //!
+  //! ⭐⭐ THE PREFERENCE IS AN EXPLICIT ARGUMENT AND DEFAULTS TO NONE. It used to be read
+  //! implicitly from `last_hwq_`, which fused two unrelated intents into one helper: "ensure this
+  //! stream has a queue" (what every caller wants) and "reattach a graph stream to the ring it
+  //! used last launch" (PR #5031's intent, and only `AcquireQueueWithPreference` means it). A
+  //! `preferred` that is still in the pool returns from `getQueueFromPool` WITHOUT EVALUATING ANY
+  //! METRIC, so the implicit form silently turned every caller into a metric-free sticky
+  //! placement decision.
+  //! ⚠️ MEASURED: routing `profilingBegin` through the implicit form (commit `b00b0ae049`) moved
+  //! the metric bypass from 0.9% to 97.0% of decisions at `DEBUG_CLR_QUEUE_PHI=2`. That commit
+  //! was an idiom cleanup with no placement intent at all -- which is exactly why the intent has
+  //! to be stated at the call site instead of inherited from a member.
+  //! ⛔ Do NOT restore a default of `last_hwq_`. Stickiness is a migration-cost preference, and
+  //! on this path the migration cost is ~0: the acquire fires only when `gpu_queue_ == nullptr`,
+  //! i.e. after a DRAIN-GATED `ReleaseHwQueue`, so the stream has no in-flight work and no
+  //! cross-queue edge can be created by moving it.
+  //! ⭐ `last_hwq_` is still CLEARED whenever an acquire actually fires, preference or not. That
+  //! is a separate and genuine fix -- a stale hint used to survive into the NEXT acquire and be
+  //! applied to a ring this stream had already left -- and it is deliberately not what changes.
+  void AcquireHwQueueIfNeeded(hsa_queue_t* preferred = nullptr);
 
   //! Snapshot the current HW queue as preferred for future re-acquisition (used by graph launch).
   //! Only updates if the queue is still valid — avoids clobbering a hint saved by ReleaseHwQueue.
