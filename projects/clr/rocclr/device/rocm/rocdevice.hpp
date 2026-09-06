@@ -973,6 +973,22 @@ class Device : public NullDevice {
     std::atomic<uint64_t> eligible{0};       //!< ... and the policy was live and in-regime
     std::atomic<uint64_t> declined_regime{0};//!< ... declined: max_hw_queues_ > numHwPipes_
     std::atomic<uint64_t> bypass_preferred{0};//!< returned via the `preferred` hint, selector unused
+    //! ⛔⛔ THE MODE-5 CENSUS MUST NOT LIVE ONLY IN THE RING. `PhiSelRec::chooser` is capped at
+    //! `kPhiTraceSel` records and the ring KEEPS THE LAST N: a run with more decisions than that
+    //! silently turns "Phi applied / Phi fell back" into "... over the last N decisions", with no
+    //! symptom. MEASURED elsewhere in this campaign: a DSV4 production trace carried 208,268
+    //! records, i.e. well past any ring we ship. These three are unbounded and they survive
+    //! `phi_sel_buf_ == nullptr` -- heap-ring mode with LOG_QUEUE off has NO chooser channel at all.
+    //! ⭐ NOT A SECOND OPINION. They are written from `phi_choice`, the SAME single signal `chooser`
+    //! is written from (`chooser == 1` iff `*phi_choice_out != nullptr`), so the two cannot drift.
+    std::atomic<uint64_t> phi_applied{0};    //!< PhiDecides(): Phi had an opinion AND it was bound
+    std::atomic<uint64_t> phi_fallback{0};   //!< PhiDecides(): `eval_w == 0`/no rank => stock stood
+    //! ⛔ THE ONE THE TRACE CANNOT TELL YOU. If the caller's pool lookup misses, stock's ring is
+    //! bound but the record already says `chooser = 1`. That path is believed unreachable (`cands`
+    //! is built from this very pool under this very lock, with no mutation in between), which is
+    //! exactly why it must be COUNTED and not asserted: an "unreachable" path that fires is
+    //! otherwise a silent instrument lie, and the trace is structurally unable to report it.
+    std::atomic<uint64_t> phi_pool_miss{0};
   };
   mutable PhiStats phi_stats_;
 
@@ -1309,6 +1325,18 @@ class Device : public NullDevice {
   //! the caller's ONLY way to opt in. If the caller could pass its own `chooser` the trace could
   //! disagree with what actually happened -- an unfalsifiable self-report. One writer, one meaning.
   //! `*phi_choice_out` is non-null IFF `PhiDecides() && eval_w`, which is exactly `chooser == 1`.
+  //! ⛔ CORRECTION, AND IT MATTERS BECAUSE THE OVERSTATEMENT IS THE DANGEROUS PART: `chooser` says
+  //! what was ASKED FOR, not unconditionally what happened. There is exactly one gap -- if the
+  //! caller's `queuePool_` lookup misses, it keeps stock's ring while this record already reads
+  //! `chooser = 1`. The gap is believed unreachable, and `phi_stats_.phi_pool_miss` is what makes
+  //! that a claim you can check instead of one you have to trust. Do NOT restore "cannot disagree".
+  //! ⭐ CHEAP CROSS-CHECK FOR EVERY READER, and it is a check that CAN fail: `chooser` is fully
+  //! DERIVABLE from fields the trace already carries -- `chooser == 1` iff (header `mode >= 5` and
+  //! `eval_w == 1`), `chooser == -1` iff the `n_rank == 0` record. MEASURED 331/331 on both the
+  //! mode-2 and mode-5 `stagger` traces. Assert it; a mismatch is a pool miss or a wiring drift.
+  //! ⛔ Because it is derivable, `chooser` is CONVENIENCE, not information -- and it was bought
+  //! with a same-`sizeof` layout bump, the one shape a record-size check cannot catch. Worth
+  //! knowing before anyone adds a second field "while we are in here".
   //! ⛔ It is written BEFORE the `phi_sel_buf_ == nullptr` early return: an unallocated TRACE must
   //! not silently switch the POLICY off. Losing the trace is a lost measurement; losing the policy
   //! while the mode says it is on is a run that reports the wrong arm.
@@ -1318,7 +1346,13 @@ class Device : public NullDevice {
   void PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
                        const std::unordered_set<uint64_t>* excluded_ids,
                        bool via_bypass,
-                       const hsa_queue_t** phi_choice_out = nullptr) const;
+                       //! ⛔ NO DEFAULT ARGUMENT, ON PURPOSE. Omitting this parameter does not mean
+                       //! "I do not care", it means THE POLICY DOES NOT RUN -- a new call site
+                       //! would silently get the CONTROL arm while the mode says 5. That is the
+                       //! same failure as `queue_phi_` truncating to 0 and as the clamp left at 4,
+                       //! both of which this campaign has already paid for. Make every caller say
+                       //! `nullptr` out loud so the compiler asks the question.
+                       const hsa_queue_t** phi_choice_out) const;
 
   hsa_queue_t* getQueueFromPool(const uint qIndex, bool force_reuse = false,
                                 hsa_queue_t* preferred = nullptr,

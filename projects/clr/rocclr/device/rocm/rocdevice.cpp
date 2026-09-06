@@ -242,8 +242,12 @@ Device::~Device() {
       }
     }
     ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+            // ⛔ TWO PRINTERS, ONE FORMAT -- and `phi_applied`/`phi_fallback`/`phi_pool_miss` have
+            // exactly one printer, this one. They are the ONLY mode-5 census that is not capped by
+            // the trace ring, so omitting them here would leave a long run with no unbounded count
+            // of whether the policy ran at all.
             "T313PHI mode=%u cap=%u pipes=%u reached=%lu eligible=%lu declined_regime=%lu "
-            "bypass_preferred=%lu slot_ovf=%lu",
+            "bypass_preferred=%lu slot_ovf=%lu phi_applied=%lu phi_fallback=%lu phi_pool_miss=%lu",
             settings().queue_phi_, settings().max_hw_queues_, numHwPipes_,
             (unsigned long)phi_stats_.reached.load(std::memory_order_relaxed),
             (unsigned long)phi_stats_.eligible.load(std::memory_order_relaxed),
@@ -252,7 +256,10 @@ Device::~Device() {
             // ⛔ Was computed and never printed. A stream that finds no slot is INVISIBLE to the
             // census: it lowers `n` and can make an occupied ring read free. Unreported, that is a
             // silent corruption of the all-occupied fraction.
-            (unsigned long)PhiSlotOverflow());
+            (unsigned long)PhiSlotOverflow(),
+            (unsigned long)phi_stats_.phi_applied.load(std::memory_order_relaxed),
+            (unsigned long)phi_stats_.phi_fallback.load(std::memory_order_relaxed),
+            (unsigned long)phi_stats_.phi_pool_miss.load(std::memory_order_relaxed));
   }
   // Drain the ROCr async-events thread before releasing any backend state.
   // This guards OCL teardown; for HIP the drain already ran via RuntimeTearDown,
@@ -4019,6 +4026,17 @@ void Device::PhiShadowReport(const uint qIndex, const hsa_queue_t* stock_choice,
   // ⭐ NOTE WHAT IS *NOT* HERE: no `excluded_ids` filter (Phi ranks the full pool by explicit
   // decision -- see Device::PhiDecides), no migration cost, no stay-put bias, no oscillation
   // damper. All four are absences ON PURPOSE and each is priced in the PhiDecides comment.
+  // ⚠️ THE DECISION GATE IS `eval_w`; THE CAMPAIGN'S OWN SCORING GATE IS `eval_w && mult_w == 1`.
+  // They are deliberately NOT the same, and the difference is not small: MEASURED 78 of 274
+  // evaluable `stagger` decisions (28%) have `mult_w > 1`, i.e. Phi_w was INDIFFERENT among the
+  // top candidates and the ring was named by the tie-break below `MetricKey` (`unmeas`, then
+  // pipe, then id). Applying those is defensible -- Phi has no preference, so any of them is
+  // equally good BY PHI -- but Phi's tie-break order is NOT stock's (`unmeas` sits ABOVE the
+  // pipe key), so such a decision can re-place the stream and be recorded as a Phi/stock
+  // DISAGREEMENT that carries no information. `mult_w` is in the trace, so the two populations
+  // are separable offline -- ⛔ but only if the scorer actually splits on it. MEASURED on the
+  // same trace: 0 of 10 disagreements had `mult_w > 1`, so no published number moves today.
+  // That is a fact about this workload, not a property of the gate.
   const bool phi_decides = PhiDecides() && phi_choice_out != nullptr;
   const int8_t chooser = (phi_decides && eval_w) ? 1 : 0;
   if (chooser == 1) *phi_choice_out = cands[best_w].q;
@@ -4150,7 +4168,14 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
           // Phi correctly excludes the joiner either way -- its `gpu_queue_` is not set until
           // getQueueFromPool returns -- but the two were not scoring the same instant.
           if (PhiShadow()) {
-            PhiShadowReport(qIndex, it->first, excluded_ids, /*via_bypass=*/true);
+            // ⛔ EXPLICIT `nullptr`: this path must NEVER be given the policy. It returns a
+            // ring without evaluating any metric, so a Phi opinion here would be applied to
+            // a decision the policy never saw the alternatives for. (At PhiDecides() the
+            // bypass is unreachable anyway, because `PhiUnbypassed()` is implied by `>= 5` --
+            // but that is a COUPLING BETWEEN TWO PREDICATES, not a guarantee at this line,
+            // and it is not enforced anywhere. Say it here.)
+            PhiShadowReport(qIndex, it->first, excluded_ids, /*via_bypass=*/true,
+                            /*phi_choice_out=*/nullptr);
           }
           it->second.refCount++;
           ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
@@ -4253,6 +4278,16 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
     if (PhiShadow()) {
       const hsa_queue_t* phi_choice = nullptr;
       PhiShadowReport(qIndex, lowest->first, excluded_ids, /*via_bypass=*/false, &phi_choice);
+      // ⛔ COUNT IT AT THE DEVICE, NOT ONLY IN THE RING. `chooser` lives in a ring that keeps the
+      // LAST kPhiTraceSel records, so on any run longer than that the applied/fallback census
+      // silently becomes a census of the tail -- and in heap-ring mode with LOG_QUEUE off there is
+      // no chooser channel at all. These counters are unbounded and survive an unallocated trace.
+      // ⭐ Written from `phi_choice`, the same single signal `chooser` is written from, so this is
+      // not a second opinion that could disagree with the trace.
+      if (PhiDecides()) {
+        (phi_choice != nullptr ? phi_stats_.phi_applied : phi_stats_.phi_fallback)
+            .fetch_add(1, std::memory_order_relaxed);
+      }
       if (phi_choice != nullptr) {
         // ⛔ `phi_choice` came from THIS pool, under THIS lock, microseconds ago, so the lookup
         // cannot miss -- which is exactly why it is checked rather than assumed. An unfindable
@@ -4263,8 +4298,15 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex, bool force_reuse,
           lowest = pit;
           chose_phi = true;
         } else {
+          // ⛔ THE ONE STATE THE TRACE CANNOT REPORT. The record for this decision is already
+          // committed with `chooser = 1`, so without this counter a pool miss makes the trace claim
+          // Phi drove a binding that stock actually made -- silently, and exactly once per
+          // occurrence. Counted at the device so it survives ring wrap and an unallocated trace.
+          // ⭐ Distinct tag: `T313PHI` alone is the teardown SUMMARY line, and a grep for it must
+          // not also match an error.
+          phi_stats_.phi_pool_miss.fetch_add(1, std::memory_order_relaxed);
           ClPrint(amd::LOG_ERROR, amd::LOG_QUEUE,
-                  "T313PHI: Phi chose queue id %lu absent from pool %u -- keeping stock's pick",
+                  "T313PHIMISS Phi chose queue id %lu absent from pool %u -- keeping stock's pick",
                   (unsigned long)phi_choice->id, qIndex);
         }
       }
