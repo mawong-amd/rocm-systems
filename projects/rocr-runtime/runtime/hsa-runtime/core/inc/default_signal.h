@@ -166,6 +166,10 @@ class BusyWaitSignal : public Signal {
   /// path is unconditional: it survives NDEBUG.
   void RejectHostAtomicRmw() const;
 
+  /// @brief Drain the write combining buffers after a host store, when the
+  /// value word is device resident.  No-op otherwise.
+  void DrainDeviceResidentStore() const;
+
  private:
   static __forceinline int& rtti_id() {
     static int rtti_id_ = 0;

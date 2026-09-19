@@ -1008,13 +1008,6 @@ typedef enum hsa_amd_agent_info_s {
    * while this numeric value remains unallocated.  A bit in an existing
    * properties word would not have that property, which is why this is a new
    * enumerant.
-   *
-   * THE NUMERIC VALUE IS PROVISIONAL AND MUST BE REALLOCATED BEFORE MERGE, and
-   * re-verified immediately before merge rather than once: this range is
-   * allocated continuously, and a caller probing a value some runtime has
-   * already spent on another bool attribute receives that attribute's answer
-   * with HSA_STATUS_SUCCESS and cannot tell the difference.  The value must be
-   * identical on every branch, because a caller passes the enumerant.
    */
   HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED = 0xA125,
 } hsa_amd_agent_info_t;
