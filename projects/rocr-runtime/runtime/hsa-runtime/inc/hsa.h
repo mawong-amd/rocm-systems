@@ -552,6 +552,27 @@ typedef enum {
    * virtual memory APIs. The type of this attribute is bool.
    */
   HSA_AMD_SYSTEM_INFO_HOST_ALLOC_DMA_BUF_SUPPORTED = 0x20A,
+  /**
+   * Returns true if some tool currently loaded into this process may perform a host
+   * read-modify-write atomic on a completion signal that this process places on a
+   * packet it submits.  The type of this attribute is bool.
+   *
+   * A host RMW against a signal whose value word lives in device memory (see
+   * ::hsa_amd_signal_create_v2 and ::HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD) is
+   * not promotable to a PCIe atomic on x86; it degrades to a non-atomic read-then-write
+   * and can lose the GPU's update.  A producer of device resident completion signals can
+   * use this query to keep them out of the packets such a tool rewrites.
+   *
+   * The answer is asked of the tool on every call rather than cached, so a caller that
+   * caches it owns that decision.  It is CONSERVATIVE in the true direction: true means
+   * "may, at any point while this answer stands", not "is, right now".
+   *
+   * A runtime that predates this query answers it with
+   * ::HSA_STATUS_ERROR_INVALID_ARGUMENT, which is a usable negative -- but only while
+   * this numeric value remains unallocated.  A bit in an existing properties word would
+   * not have that property, which is why this is a new enumerant.
+   */
+  HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED = 0x20B,
 } hsa_system_info_t;
 
 /**

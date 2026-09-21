@@ -86,9 +86,10 @@
  * - 1.32 - hsa_amd_svm_discard_and_prefetch_batch_async
  * - 1.33 - hsa_amd_signal_create_v2, hsa_amd_signal_create_desc_t
  * - 1.34 - hsa_amd_agent_info_t: HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED
+ * - 1.35 - hsa_system_info_t: HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED
  */
 #define HSA_AMD_INTERFACE_VERSION_MAJOR 1
-#define HSA_AMD_INTERFACE_VERSION_MINOR 34
+#define HSA_AMD_INTERFACE_VERSION_MINOR 35
 
 #ifdef __cplusplus
 extern "C" {

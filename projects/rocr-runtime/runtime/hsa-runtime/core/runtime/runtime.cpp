@@ -85,6 +85,7 @@ extern "C" void __sanitizer_purge_allocator(void);
 #include "core/inc/host_queue.h"
 #include "core/inc/hsa_api_trace_int.h"
 #include "core/inc/hsa_ext_amd_impl.h"
+#include "core/inc/hsa_amd_tool_int.hpp"
 #include "core/inc/hsa_ext_interface.h"
 #include "core/inc/interrupt_signal.h"
 #include "core/inc/signal.h"
@@ -947,6 +948,10 @@ hsa_status_t Runtime::GetSystemInfo(hsa_system_info_t attribute, void* value) {
       auto* runtime = core::Runtime::runtime_singleton_;
       *((bool*)value) = runtime->VirtualMemApiSupported() && !runtime->gpu_agents().empty() &&
                         !runtime->thunkLoader()->IsDXG();
+      break;
+    }
+    case HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED: {
+      *((bool*)value) = AMD::tool::query_signal_host_rmw();
       break;
     }
     default:

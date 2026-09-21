@@ -66,7 +66,12 @@ void BusyWaitSignal::RejectHostAtomicRmw() const {
   // corrupt the value word, so stop.
   fprintf(stderr,
           "HSA: read-modify-write on a device resident signal value word is "
-          "not supported.\n");
+          "not supported.\n"
+          "HSA: this is reached when a tool interposes a queue and reference counts a "
+          "completion signal the application placed in device memory.  A tool must "
+          "answer HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED true so the producer "
+          "can keep such signals off the packets the tool rewrites.  For HIP graphs the "
+          "producer side override is DEBUG_CLR_GRAPH_COMPLETION_BARRIER=1.\n");
   abort();
 }
 

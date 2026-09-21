@@ -147,6 +147,11 @@ struct ToolsApiTable {
   hsa_amd_tool_event hsa_amd_tool_scratch_event_free_end_fn;
   hsa_amd_tool_event hsa_amd_tool_scratch_event_async_reclaim_start_fn;
   hsa_amd_tool_event hsa_amd_tool_scratch_event_async_reclaim_end_fn;
+
+  // Added at HSA_TOOLS_API_TABLE_STEP_VERSION 0x01.  A tool built against an older
+  // header leaves this null; the runtime must therefore check version.minor_id
+  // (== sizeof(ToolsApiTable)) before reading it, not just the pointer.
+  hsa_amd_tool_event hsa_amd_tool_query_signal_host_rmw_fn;
 };
 
 // Table to export HSA Finalizer Extension Apis

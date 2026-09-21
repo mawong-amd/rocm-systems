@@ -90,7 +90,7 @@ void HsaApiTable::Init() {
   constexpr size_t expected_amd_ext_table_size = 760;
   constexpr size_t expected_image_ext_table_size = 128;
   constexpr size_t expected_finalizer_ext_table_size = 64;
-  constexpr size_t expected_tools_table_size = 64;
+  constexpr size_t expected_tools_table_size = 72;
   constexpr size_t expected_pc_sampling_ext_table_size = 72;
 
   static_assert(sizeof(CoreApiTable) == expected_core_api_table_size,
@@ -508,6 +508,7 @@ void HsaApiTable::UpdateTools() {
   tools_api.hsa_amd_tool_scratch_event_free_end_fn = nullptr;
   tools_api.hsa_amd_tool_scratch_event_async_reclaim_start_fn = nullptr;
   tools_api.hsa_amd_tool_scratch_event_async_reclaim_end_fn = nullptr;
+  tools_api.hsa_amd_tool_query_signal_host_rmw_fn = nullptr;
 }
 
 void LoadInitialHsaApiTable() {

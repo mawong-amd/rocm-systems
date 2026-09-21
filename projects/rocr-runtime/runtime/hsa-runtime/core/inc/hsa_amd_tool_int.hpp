@@ -28,6 +28,13 @@ __forceinline void notify_event_scratch_async_reclaim_end(const hsa_queue_t* que
                                                           scratch_alloc_flag flag);
 
 
+/// Ask the loaded tool, if any, whether it may perform a host read-modify-write atomic
+/// on an application completion signal.  False when no tool is loaded, when the tool
+/// predates the query, or when the tool answers no.  Asked on demand and never cached
+/// here: the answer is the tool's to change.
+__forceinline bool query_signal_host_rmw();
+
+
 // Impl
 
 __forceinline void notify_event_scratch_alloc_start(const hsa_queue_t* queue,
@@ -134,6 +141,33 @@ __forceinline void notify_event_scratch_async_reclaim_end(const hsa_queue_t* que
 
   tool_table.hsa_amd_tool_scratch_event_async_reclaim_end_fn(
       hsa_amd_tool_event_t{.scratch_async_reclaim_end = &event});
+}
+
+__forceinline bool query_signal_host_rmw() {
+  const auto& tool_table = core::hsa_api_table().tools_api;
+
+  // No size check here on purpose: this table is the runtime's own instance, so its
+  // size is this build's sizeof(ToolsApiTable) by construction and any check against it
+  // could not fail.  The version skew that is real runs the other way -- a tool built
+  // against an older header -- and that tool simply never writes the slot, leaving it
+  // null.  The tool side is where the size guard belongs, and is where it is.
+  if (!tool_table.hsa_amd_tool_query_signal_host_rmw_fn) {
+    return false;
+  }
+
+  // Pre-filled with the answer that preserves behaviour in the absence of a tool, so a
+  // tool that returns an error, or one that ignores the out field, cannot turn the
+  // feature on by accident.
+  auto event = hsa_amd_tool_event_query_signal_host_rmw_t{
+      .kind = HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW,
+      .host_rmw_on_completion_signal = 0,
+  };
+
+  if (tool_table.hsa_amd_tool_query_signal_host_rmw_fn(
+          hsa_amd_tool_event_t{.query_signal_host_rmw = &event}) != HSA_STATUS_SUCCESS) {
+    return false;
+  }
+  return event.host_rmw_on_completion_signal != 0;
 }
 
 // }  // namespace rocr::AMD::tool
