@@ -28,6 +28,7 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_api_trace.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -177,6 +178,74 @@ cas_write_index_impl(QueueState*       state,
  */
 uint64_t
 load_write_index_impl(const QueueState* state, std::memory_order order = std::memory_order_relaxed);
+
+/// One sample of a completion signal's ABI block: the value word and the dispatch
+/// timestamps, all read from that one block.
+struct sampled_timing
+{
+    hsa_signal_value_t value = 0;
+    uint64_t           start = 0;
+    uint64_t           end   = 0;
+};
+
+/// Reads the three words out of an amd_signal_t ABI block, by volatile load.
+///
+/// Volatile is defensive: the two calls that straddle the timestamp copy read a block
+/// this translation unit never writes, so nothing in the language stops a compiler from
+/// proving the second read equal to the first and folding it away -- which would leave
+/// timing_sample_is_stable() unable to report a change and turn the detector into a check
+/// that cannot fail. Removing the qualifier does NOT currently make the unit test fail
+/// (measured), so treat this as a guard against a future inlining, not as a demonstrated
+/// necessity.
+///
+/// `block` is a signal handle, which in this ABI is the address of the block. A
+/// device-resident value word supports loads and plain stores; only a read-modify-write
+/// is refused, so this is legal on the signals this path exists for.
+sampled_timing
+sample_signal_block(const void* block);
+
+/// True if two samples taken either side of the timestamp copy agree, i.e. the signal was
+/// not re-armed under the read and the pair can be trusted for this dispatch.
+///
+/// Needed only when this layer holds NO reference on the signal, which is the case for a
+/// completion signal that refuses a host read-modify-write. See the test block in
+/// tests/queue_interposition.cpp for what it can and cannot see.
+bool
+timing_sample_is_stable(const sampled_timing& a, const sampled_timing& b);
+
+/// Coverage accounting for the unreferenced path, so a break in the chain
+/// skipped -> read -> kept is visible from a release build with no rebuild. Modelled on
+/// kfd::signal_less_counter, which reports the same class of loss ("these dispatches emit
+/// no record") the same way.
+enum class unreferenced_counter
+{
+    ref_skipped = 0,   ///< dispatches whose reference this layer declined to take
+    timing_read,       ///< timestamp copies attempted on those dispatches
+    dropped_rearmed,   ///< copies discarded because the signal moved under the read
+    blank_timestamps,  ///< copies whose sampled block carried no timestamps at all
+    kCount
+};
+
+/// Bumps a counter and returns its PRE-increment value, so exactly one caller can take
+/// the "first of these" action without a second latch to keep in sync.
+uint64_t
+note_unreferenced(unreferenced_counter which, uint64_t n = 1);
+
+/// How many records this path lost, summed over every drop reason. One definition, so a
+/// new reason cannot appear in the counter chain and be missing from the headline number.
+uint64_t
+unreferenced_dropped_total();
+
+/// Snapshot indexed by unreferenced_counter, so a new counter needs no mirror struct --
+/// add an enumerator and a name and it prints.
+using unreferenced_counter_array =
+    std::array<uint64_t, static_cast<size_t>(unreferenced_counter::kCount)>;
+
+unreferenced_counter_array
+unreferenced_stats();
+
+const char*
+unreferenced_counter_name(unreferenced_counter which);
 
 /// Type alias for doorbell function callback
 using doorbell_fn_t = std::function<void(hsa_signal_t, hsa_signal_value_t)>;

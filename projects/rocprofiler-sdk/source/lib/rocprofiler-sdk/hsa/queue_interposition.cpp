@@ -68,6 +68,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -194,6 +195,211 @@ load_write_index_impl(const QueueState* state, std::memory_order order)
 {
     return state->virtual_wptr.load(order);
 }
+
+sampled_timing
+sample_signal_block(const void* block)
+{
+    // Volatile, and one field at a time: this TU never writes the block, so without
+    // volatile a compiler may prove the second sample equal to the first and fold it away,
+    // leaving timing_sample_is_stable() unable to report a change.
+    const auto* _blk = static_cast<const volatile amd_signal_t*>(block);
+    auto        _out = sampled_timing{};
+    _out.value       = static_cast<hsa_signal_value_t>(_blk->value);
+    _out.start       = _blk->start_ts;
+    _out.end         = _blk->end_ts;
+    return _out;
+}
+
+bool
+timing_sample_is_stable(const sampled_timing& a, const sampled_timing& b)
+{
+    // The value word catches an observable re-arm. The TIMESTAMPS catch the case a
+    // value-only check misses: a signal re-armed to 1 and driven back to 0 reads the same
+    // value at both samples while carrying a different launch's timing. Both must agree,
+    // or the pair is not this dispatch's.
+    return a.value == b.value && a.start == b.start && a.end == b.end;
+}
+
+namespace
+{
+std::atomic<uint64_t> g_unreferenced_counters[static_cast<size_t>(unreferenced_counter::kCount)] =
+    {};
+}  // namespace
+
+uint64_t
+note_unreferenced(unreferenced_counter which, uint64_t n)
+{
+    return g_unreferenced_counters[static_cast<size_t>(which)].fetch_add(
+        n, std::memory_order_relaxed);
+}
+
+uint64_t
+unreferenced_dropped_total()
+{
+    // One place computes "how many records were lost", so a new drop reason cannot be
+    // counted in the chain and silently missing from the headline number.
+    const auto _c = unreferenced_stats();
+    return _c[static_cast<size_t>(unreferenced_counter::dropped_rearmed)];
+}
+
+unreferenced_counter_array
+unreferenced_stats()
+{
+    auto _s = unreferenced_counter_array{};
+    for(size_t i = 0; i < _s.size(); ++i)
+        _s[i] = g_unreferenced_counters[i].load(std::memory_order_relaxed);
+    return _s;
+}
+
+const char*
+unreferenced_counter_name(unreferenced_counter which)
+{
+    switch(which)
+    {
+        case unreferenced_counter::ref_skipped: return "ref-skipped";
+        case unreferenced_counter::timing_read: return "timing-read";
+        case unreferenced_counter::dropped_rearmed: return "dropped-rearmed";
+        case unreferenced_counter::blank_timestamps: return "blank-timestamps";
+        case unreferenced_counter::kCount: break;
+    }
+    return "?";
+}
+
+namespace
+{
+// ROCPROFILER_INLINE_NO_HOST_REF, read once and cached.
+//
+// DEFAULT ON, unlike every other switch in this file, and deliberately: the predicate
+// below is true only for a completion signal whose value word is device resident, and on
+// such a signal the reference this layer would otherwise take is not merely undesirable,
+// it is an abort (this ROCr) or a lost GPU update (upstream ROCr). Defaulting off would
+// ship a library that still kills the application it is profiling. An application with no
+// device-resident completion signals never reaches the branch at all, so the blast radius
+// of the default is exactly the set of programs the old code could not profile.
+//
+// Opt-out policy copied from kfd/env_parse.hpp's env_bool_opt_in (inverted): an
+// unrecognized value keeps the default rather than silently flipping it, which
+// common::get_env<bool> would do -- it maps "flase" to TRUE.
+bool
+no_host_ref_enabled()
+{
+    static const bool _v = []() {
+        auto _raw = common::get_env_optional("ROCPROFILER_INLINE_NO_HOST_REF");
+        if(!_raw) return true;
+        const std::string& _s = *_raw;
+        if(_s == "1" || _s == "true" || _s == "yes" || _s == "on") return true;
+        if(_s == "0" || _s == "false" || _s == "no" || _s == "off") return false;
+        ROCP_WARNING << "[queue-interposition] ROCPROFILER_INLINE_NO_HOST_REF='" << _s
+                     << "' is not one of 1/true/yes/on or 0/false/no/off; keeping the default "
+                        "(ENABLED)";
+        return true;
+    }();
+    return _v;
+}
+
+// True when a host read-modify-write on this signal is refused, i.e. its value word is
+// device resident. hsa_amd_signal_value_pointer answers exactly this question and is
+// already in the AmdExtTable, so there is no new ABI: it returns INVALID_SIGNAL for a
+// device-resident signal and INVALID_ARGUMENT for an ordinary interrupt signal. An
+// invalid handle also answers INVALID_SIGNAL; conflating the two is safe here because
+// both mean "do not read-modify-write this", which is the only thing the caller asks.
+//
+// Cached per handle: a runtime's ordering edges come from a small fixed per-device pool,
+// so the distinct-handle set is tiny and this is a hash lookup in steady state.
+bool
+signal_refuses_host_rmw(hsa_signal_t sig)
+{
+    if(sig.handle == 0) return false;
+    static auto _cache = common::Synchronized<std::unordered_map<uint64_t, bool>>{};
+
+    if(auto _hit = _cache.rlock([&](const auto& m) -> int {
+           auto itr = m.find(sig.handle);
+           return (itr == m.end()) ? -1 : (itr->second ? 1 : 0);
+       });
+       _hit >= 0)
+        return _hit == 1;
+
+    const auto* _ext = get_amd_ext_table();
+    if(_ext == nullptr || _ext->hsa_amd_signal_value_pointer_fn == nullptr) return false;
+    volatile hsa_signal_value_t* _p = nullptr;
+    const bool                   _refuses =
+        (_ext->hsa_amd_signal_value_pointer_fn(sig, &_p) == HSA_STATUS_ERROR_INVALID_SIGNAL);
+    _cache.wlock([&](auto& m) { m[sig.handle] = _refuses; });
+    return _refuses;
+}
+
+// Loss accounting is the cost of this option, so it is reported the way the one other
+// subsystem that accepts coverage loss reports it (kfd::signal_less): a fixed counter
+// set, a first-engagement warning, a handful of identified examples, and one
+// unconditional summary line at teardown. Deliberately NOT a buffer record -- see the
+// note on the summary below.
+constexpr uint64_t kMaxDropExamples = 10;
+
+// Counts the drop and identifies the first few, because the RATE alone does not answer
+// the question the rate is used for. A biased 0.4% is worse than an unbiased 5%: if the
+// re-arm race were structural, the same graph boundary would be lost on every replay and
+// a consistently absent edge reads as structure that is not there. The signal handle
+// alone is not enough -- two segments recycling one pool slot share it -- so the kernel
+// id goes out with it.
+// Identifies the first few drops, because the RATE alone does not answer the question the
+// rate is used for. A biased 0.4% is worse than an unbiased 5%: if the re-arm race were
+// structural, the same graph boundary would be lost on every replay and a consistently
+// absent edge reads as structure that is not there. The signal handle alone is not enough
+// -- two segments recycling one pool slot share it -- so the kernel id goes out with it.
+void
+log_unreferenced_drop(const packet_data_t&  packet,
+                      const sampled_timing& s0,
+                      const sampled_timing& s1,
+                      std::string_view      why)
+{
+    const auto& _di = packet.callback_record.dispatch_info;
+    ROCP_INFO << fmt::format(
+        "[queue-interposition] unreferenced completion signal 0x{:x} {}; kernel_id={} "
+        "dispatch_id={} queue_id={} value {}->{} start {}->{} end {}->{}. This dispatch emits "
+        "no record.",
+        packet.completion_signal.handle,
+        why,
+        static_cast<uint64_t>(_di.kernel_id),
+        static_cast<uint64_t>(_di.dispatch_id),
+        static_cast<uint64_t>(_di.queue_id.handle),
+        static_cast<long long>(s0.value),
+        static_cast<long long>(s1.value),
+        s0.start,
+        s1.start,
+        s0.end,
+        s1.end);
+}
+
+void
+report_unreferenced_summary()
+{
+    const auto _c = unreferenced_stats();
+    // Nothing engaged: say nothing. A summary of zeros on every ordinary run would train
+    // the reader to ignore the line that matters.
+    if(_c[static_cast<size_t>(unreferenced_counter::ref_skipped)] == 0) return;
+
+    auto _chain = std::string{};
+    for(size_t i = 0; i < _c.size(); ++i)
+        _chain += fmt::format("{}{}={}",
+                              i == 0 ? "" : " ",
+                              unreferenced_counter_name(static_cast<unreferenced_counter>(i)),
+                              _c[i]);
+
+    const auto _read    = _c[static_cast<size_t>(unreferenced_counter::timing_read)];
+    const auto _dropped = unreferenced_dropped_total();
+    ROCP_WARNING << fmt::format(
+        "[queue-interposition] unreferenced completion signals summary: {}; {} kernel dispatch "
+        "record(s) of {} read from a signal this layer could not reference were discarded "
+        "({:.4f}%) because the application re-armed the signal while their timestamps were "
+        "being copied. Those dispatches emit no record. Set "
+        "ROCPROFILER_INLINE_NO_HOST_REF=0 to take the reference instead, which restores full "
+        "coverage and terminates the process on such a signal.",
+        _chain,
+        _dropped,
+        _read,
+        (_read > 0) ? (100.0 * static_cast<double>(_dropped) / static_cast<double>(_read)) : 0.0);
+}
+}  // namespace
 
 namespace
 {
@@ -502,8 +708,42 @@ release_completion_signals(const std::shared_ptr<queue_info_session_t>& session,
 
     for(auto& packet : session->packet_data)
     {
-        if(completed)
+        if(completed && packet.unreferenced)
+        {
+            // No reference was taken, so the application may re-arm this signal under the
+            // copy. Sample the signal block either side and discard the pair if it moved:
+            // bounded, accounted loss instead of an undetectably-wrong record.
+            const auto* _blk = reinterpret_cast<const void*>(packet.completion_signal.handle);
+            const auto  _s0  = sample_signal_block(_blk);
+            auto        _t   = kernel_dispatch::get_dispatch_time(*session, packet);
+            const auto  _s1  = sample_signal_block(_blk);
+
+            note_unreferenced(unreferenced_counter::timing_read);
+            // A wiring check that can fail: if this sampler were reading the wrong object
+            // or the wrong offset, a block with no timestamps at all would be the normal
+            // case rather than a rarity, and "the detector never fired" would be
+            // uninterpretable. Counted, never dropped on.
+            if(_s0.start == 0 && _s0.end == 0)
+                note_unreferenced(unreferenced_counter::blank_timestamps);
+
+            if(!timing_sample_is_stable(_s0, _s1))
+            {
+                const auto _n = note_unreferenced(unreferenced_counter::dropped_rearmed);
+                if(_n < kMaxDropExamples)
+                    log_unreferenced_drop(
+                        packet, _s0, _s1, "was re-armed while its timestamps were being copied");
+                // dispatch_complete() early-returns on a non-SUCCESS status, so this drops
+                // the record downstream without new plumbing, and matches what the tracing
+                // path already does when a dispatch's timestamps cannot be trusted
+                // (kernel_dispatch/tracing.cpp).
+                _t.status = HSA_STATUS_ERROR_INVALID_SIGNAL;
+            }
+            batch.dispatch_times.emplace_back(_t);
+        }
+        else if(completed)
+        {
             batch.dispatch_times.emplace_back(kernel_dispatch::get_dispatch_time(*session, packet));
+        }
 
         if(packet.pooled_signal)
         {
@@ -513,10 +753,12 @@ release_completion_signals(const std::shared_ptr<queue_info_session_t>& session,
             // use instead leaves a leak pool::clear reports.
             if(completed) Queue::release_signal(packet.pooled_signal);
         }
-        else
+        else if(!packet.unreferenced)
         {
             // The application waits on this one and apply_signal_path added 1 to it, so the
             // subtract is unconditional: skipping it leaves the application waiting forever.
+            // An `unreferenced` packet never got that 1 -- subtracting here would both
+            // abort in ROCr and corrupt the application's own count.
             get_core_table()->hsa_signal_subtract_relaxed_fn(packet.completion_signal, 1);
         }
     }
@@ -1132,7 +1374,35 @@ write_interceptor(Queue*                                queue,
             auto& _cs = pd.kernel_packet.kernel_dispatch.completion_signal;
 #endif
             if(_cs == null_signal) pd.pooled_signal = create_signal(&_cs);
-            get_core_table()->hsa_signal_add_scacq_screl_fn(_cs, 1);
+            // The predicate is consulted ONLY for an application-supplied signal: a pooled
+            // one is never device resident, and `_cs == null_signal` here would mean the
+            // pool refused, which is the pre-existing add-on-handle-0 path and not ours to
+            // change. Both conditions are spelled out rather than implied.
+            if(pd.pooled_signal == nullptr && _cs != null_signal && no_host_ref_enabled() &&
+               signal_refuses_host_rmw(_cs))
+            {
+                // Take no reference: the add is a host read-modify-write, which on a
+                // device-resident value word is not promoted to a PCIe atomic. ROCr
+                // refuses it. The matching subtract is skipped too, and the timestamp copy
+                // is validated in release_completion_signals instead.
+                pd.unreferenced = true;
+                if(note_unreferenced(unreferenced_counter::ref_skipped) == 0)
+                {
+                    ROCP_WARNING << fmt::format(
+                        "[queue-interposition] completion signal 0x{:x} refuses a host "
+                        "read-modify-write (its value word is device resident), so this layer "
+                        "holds no reference on it and validates each timestamp copy instead. A "
+                        "copy the application re-armed under is discarded and that dispatch "
+                        "emits no record; the counts are summarized at teardown. Set "
+                        "ROCPROFILER_INLINE_NO_HOST_REF=0 to take the reference anyway, which "
+                        "terminates the process on such a signal.",
+                        _cs.handle);
+                }
+            }
+            else
+            {
+                get_core_table()->hsa_signal_add_scacq_screl_fn(_cs, 1);
+            }
             pd.completion_signal = _cs;
             return _cs;
         };
@@ -2106,6 +2376,14 @@ interposition_fini()
     // out, so skip it. The atomic stores above are kept: they are safe and make the
     // child's interception inert.
     if(internal_threading::fork_stale()) return;
+
+    // Accepted coverage loss is reported once, unconditionally, from the one place that
+    // sees the whole run -- the same shape as the KFD signal-less summary. Deliberately a
+    // log line and not a buffer record: the only loss-reporting record kind in this API is
+    // KFD-scoped and would misattribute this loss to the driver, a record can itself be
+    // dropped by the buffer it is reporting loss into, and every other accepted-loss path
+    // in this library reports through the logger.
+    report_unreferenced_summary();
 
     // clean up signal pool
     signal_pool_fini();

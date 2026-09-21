@@ -172,6 +172,134 @@ TEST(queue_interposition, load_write_index_returns_virtual_wptr)
     EXPECT_EQ(load_write_index_impl(&state), 99u);
 }
 
+// =====================================================================================
+// RE-ARM-UNDER-READ DETECTOR
+//
+// For a completion signal that refuses a host read-modify-write (its value word is device
+// resident), this layer cannot take the usual reference. Without it the application is
+// free to recycle and RE-ARM that signal while the dispatch timestamps are being copied
+// out of it -- and the pair read then belongs to a DIFFERENT launch.
+//
+// Such a pair is well-formed, in-bounds and plausible, so adjust_profiling_time() REPAIRS
+// rather than drops it and the corruption is invisible downstream. The rule is therefore
+// DETECT AND DROP, never "accept a corruption rate".
+//
+// The detector samples (value, start_ts, end_ts) twice around the copy and demands both
+// agree. Sampling the TIMESTAMPS as well as the value is what makes it useful: the
+// dangerous case is precisely a re-arm that completes and writes NEW timestamps, and a
+// value-only check can miss it when the value happens to return to where it started
+// (armed to 1, driven to 0 again).
+//
+// WHAT THIS CANNOT SEE, stated before it is run:
+//  * a re-arm that completes AND reproduces a byte-identical timestamp pair -- it would
+//    need the same two 64-bit GPU clock readings twice;
+//  * a re-arm that completed BEFORE the first sample, i.e. the completion monitor polled
+//    late and the whole copy sees a later launch's stable state. Both samples agree and
+//    the pair is silently another launch's. Nothing in this pair-comparison can see that;
+//    the separable "not idle at copy time" hunk is what narrows it.
+// =====================================================================================
+
+TEST(queue_interposition, rearm_detector_accepts_a_stable_sample)
+{
+    const auto a = sampled_timing{.value = 0, .start = 1000, .end = 2000};
+    const auto b = sampled_timing{.value = 0, .start = 1000, .end = 2000};
+    EXPECT_TRUE(timing_sample_is_stable(a, b)) << "identical samples must be trusted";
+}
+
+TEST(queue_interposition, rearm_detector_catches_a_rearm_by_value)
+{
+    // The application recycled the signal and armed it back to 1 under the read.
+    const auto a = sampled_timing{.value = 0, .start = 1000, .end = 2000};
+    const auto b = sampled_timing{.value = 1, .start = 1000, .end = 2000};
+    EXPECT_FALSE(timing_sample_is_stable(a, b))
+        << "the signal value moved under the read: it was re-armed and this pair may belong "
+           "to a different launch";
+}
+
+TEST(queue_interposition, rearm_detector_catches_a_rearm_by_timestamps)
+{
+    // The value returned to where it started (armed to 1, driven back to 0), so a
+    // value-only check would MISS this -- but the timestamps are a different launch's.
+    const auto a = sampled_timing{.value = 0, .start = 1000, .end = 2000};
+    const auto b = sampled_timing{.value = 0, .start = 5000, .end = 6000};
+    EXPECT_FALSE(timing_sample_is_stable(a, b))
+        << "timestamps changed under the read; a value-only detector would have accepted "
+           "this and emitted another launch's timing as this dispatch's";
+}
+
+TEST(queue_interposition, rearm_detector_catches_a_partial_timestamp_change)
+{
+    const auto a = sampled_timing{.value = 0, .start = 1000, .end = 2000};
+    const auto b = sampled_timing{.value = 0, .start = 1000, .end = 2001};
+    EXPECT_FALSE(timing_sample_is_stable(a, b)) << "end_ts alone moving is still a torn read";
+}
+
+TEST(queue_interposition, sampler_reads_the_three_words_it_claims_to)
+{
+    // Wiring, not logic: a sampler pointed at the wrong object or the wrong offsets would
+    // report zeros forever and the detector could never fire, which is indistinguishable
+    // from "there was nothing to detect".
+    auto _blk     = amd_signal_t{};
+    _blk.value    = 7;
+    _blk.start_ts = 1234;
+    _blk.end_ts   = 5678;
+
+    const auto _s = sample_signal_block(&_blk);
+    EXPECT_EQ(_s.value, 7);
+    EXPECT_EQ(_s.start, 1234u);
+    EXPECT_EQ(_s.end, 5678u);
+}
+
+TEST(queue_interposition, sampler_observes_a_rearm_written_by_another_thread)
+{
+    // THE POSITIVE CONTROL. The unit tests above feed the comparator constructed values;
+    // this one drives the REAL sampler across a mutation it cannot see coming, which is
+    // the shape of the in-situ failure. The writer runs on another thread on purpose: an
+    // in-line store would be visible to the optimizer, and the second sample could then be
+    // folded into the first -- a detector that cannot fail. With the volatile loads in
+    // sample_signal_block this test passes; remove them and it is free to stop passing.
+    auto _blk     = amd_signal_t{};
+    _blk.value    = 0;
+    _blk.start_ts = 1000;
+    _blk.end_ts   = 2000;
+
+    auto _go   = std::atomic<bool>{false};
+    auto _done = std::atomic<bool>{false};
+    auto _thr  = std::thread{[&]() {
+        while(!_go.load(std::memory_order_acquire))
+        {}
+        // A completed re-arm: the value returns to 0, only the timestamps betray it.
+        _blk.start_ts = 9000;
+        _blk.end_ts   = 9100;
+        _done.store(true, std::memory_order_release);
+    }};
+
+    const auto _s0 = sample_signal_block(&_blk);
+    _go.store(true, std::memory_order_release);
+    while(!_done.load(std::memory_order_acquire))
+    {}
+    const auto _s1 = sample_signal_block(&_blk);
+    _thr.join();
+
+    EXPECT_EQ(_s0.start, 1000u) << "first sample must predate the re-arm";
+    EXPECT_EQ(_s1.start, 9000u)
+        << "the second sample was folded into the first: the block was re-read as if "
+           "unchanged, so the detector cannot fire on hardware either";
+    EXPECT_EQ(_s0.value, _s1.value) << "value-only detection would have MISSED this re-arm";
+    EXPECT_FALSE(timing_sample_is_stable(_s0, _s1))
+        << "a completed re-arm with identical value words must still be rejected";
+}
+
+TEST(queue_interposition, unreferenced_counter_names_are_complete)
+{
+    // The summary prints by walking the enum, so a counter added without a name reads as
+    // "?=N" in the one line the user sees.
+    for(size_t i = 0; i < static_cast<size_t>(unreferenced_counter::kCount); ++i)
+        EXPECT_STRNE(unreferenced_counter_name(static_cast<unreferenced_counter>(i)), "?")
+            << "counter " << i << " has no name";
+    EXPECT_EQ(unreferenced_stats().size(), static_cast<size_t>(unreferenced_counter::kCount));
+}
+
 namespace
 {
 hsa_kernel_dispatch_packet_t*

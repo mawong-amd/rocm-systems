@@ -61,6 +61,13 @@ struct packet_data_t
     rocprofiler_user_data_t user_data               = {.value = 0};
     pooled_signal_t*        pooled_signal           = nullptr;
     bool                    is_serialized           = false;
+
+    /// This layer took NO reference on `completion_signal`, because that signal refuses a
+    /// host read-modify-write (its value word is device resident). Two consequences: the
+    /// matching subtract must be skipped, and the application is free to re-arm the
+    /// signal while its timestamps are being copied, so the copy has to be validated.
+    /// See queue_interposition::timing_sample_is_stable().
+    bool                    unreferenced            = false;
 };
 
 // Internal session information that is used by write interceptor

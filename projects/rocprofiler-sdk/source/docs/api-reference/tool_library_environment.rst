@@ -123,6 +123,37 @@ automatically based on the services your tool enables.
         If you set this to ``true`` while a context that requires the legacy
         path (counter collection, ATT, or PC sampling) is registered, the SDK
         logs a warning and falls back to the legacy path anyway.
+    * - ``ROCPROFILER_INLINE_NO_HOST_REF``
+      - ``true``
+      - Boolean. Applies only to *inline* interposition, and only to a kernel
+        dispatch whose completion signal refuses a host read-modify-write --
+        that is, a signal created by ``hsa_amd_signal_create_v2`` with
+        ``HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD``, whose value word lives
+        in device memory.
+
+        Inline interposition normally increments the application's completion
+        signal by one while it is holding the dispatch, and decrements it once
+        the dispatch timestamps have been copied out. On a device-resident value
+        word that increment is a host read-modify-write, which x86 does not
+        promote to a PCIe atomic: it becomes a read followed by an independent
+        write and can lose the command processor's concurrent update. The HSA
+        runtime refuses it and terminates the process rather than corrupt the
+        signal.
+
+        At the default (``true``) the SDK takes no reference on such a signal.
+        The application is then free to re-arm it while the timestamps are being
+        copied, so each copy is validated by sampling the signal's value word and
+        both timestamps either side of it; a copy the signal moved under is
+        discarded and **that dispatch emits no kernel dispatch record**. The
+        first such signal is named in a warning, the first few discards are
+        logged at ``info``, and the counts are summarized in one warning at
+        teardown. Ordinary system-memory completion signals are untouched, so a
+        process that has none of these signals never reaches this path.
+
+        Set it to ``false`` to take the reference unconditionally, which restores
+        full record coverage and returns to terminating the process on such a
+        signal. There is no setting that is both complete and safe; this variable
+        chooses which.
 
 Kernel dispatch timestamp source
 --------------------------------
