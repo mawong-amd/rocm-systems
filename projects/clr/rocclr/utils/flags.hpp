@@ -219,6 +219,10 @@ release(uint, ROC_EDGE_SIGNAL_POOL_SIZE, 16384,                               \
         "Number of device resident ordering edge signals per device")         \
 release(bool, DEBUG_CLR_DISABLE_ORDERING_EDGE, false,                         \
         "Revert cross queue dependencies to a host resident value word")      \
+release(uint, DEBUG_CLR_GRAPH_COMPLETION_BARRIER, 2,                          \
+        "Where a graph segment's completion signal is carried: 0 last kernel " \
+        "dispatch of the segment, 1 its own barrier packet, 2 (default) its "  \
+        "own barrier packet iff a tool reports it may host-RMW the signal")    \
 release(uint, DEBUG_CLR_LIMIT_BLIT_WG, 16,                                    \
         "Limit the number of workgroups in blit operations")                  \
 release(bool, DEBUG_CLR_BLIT_KERNARG_OPT, false,                              \

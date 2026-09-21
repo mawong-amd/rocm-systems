@@ -4232,6 +4232,22 @@ uint8_t* Device::CreateBarrierPacket() const {
 }
 
 // ================================================================================================
+int Device::signalHostRmwInterposed() const {
+  bool interposed = false;
+  if (HSA_STATUS_SUCCESS !=
+      Hsa::system_get_info(
+          static_cast<hsa_system_info_t>(HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED),
+          &interposed)) {
+    // The attribute is unallocated on a runtime that predates the query, and an
+    // unallocated attribute is rejected rather than answered.  Reported as unknown, which
+    // callers treat as "no" - that is the historical behaviour - but which is visible as
+    // a distinct value so that a broken channel does not read as a negative answer.
+    return -1;
+  }
+  return interposed ? 1 : 0;
+}
+
+// ================================================================================================
 void Device::ApplyHwEventPatches(const std::vector<HwEventPatch>& patches,
                                  const std::vector<void*>& hw_events) const {
   for (const auto& patch : patches) {

@@ -683,6 +683,11 @@ class Device : public NullDevice {
   //! at create() time, by HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED.
   bool orderingEdgeSignals() const { return ordering_edge_signals_; }
 
+  //! HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED, asked live.  A ROCr that predates
+  //! the query rejects the attribute, which is reported as -1 rather than as "no" so a
+  //! missing channel is distinguishable from a negative answer in the log.
+  int signalHostRmwInterposed() const override;
+
   //! Takes a free ordering edge slot, arms it and returns its handle, or {0} if none is
   //! available.  Never blocks, never allocates and never grows the pool: a caller that
   //! cannot get a slot keeps today's host resident dependency for that one event.

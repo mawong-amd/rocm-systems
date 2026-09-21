@@ -413,6 +413,26 @@ void GraphExecSegmented::BuildSyncPlan() {
 
   auto* device = g_devices[captureDeviceId_]->devices()[0];
 
+  // A completion signal on a kernel dispatch packet is exposed to any tool that
+  // interposes the queue and rewrites dispatch packets; on its own barrier packet it is
+  // not.  The signal's value word is device resident, and a host read-modify-write
+  // against device memory is not promotable to a PCIe atomic on x86, so a tool that
+  // reference counts what it sees either aborts the process or loses the GPU's update.
+  //
+  // Mode 2 (default) asks the runtime, once per instantiate, whether such a tool is
+  // loaded.  Asking here rather than caching at device create is what makes a graph
+  // built after a tool arrives get the safe placement; graphs already instantiated
+  // cannot be revisited, which is why the tool side treats arming late as a fatal error.
+  const int host_rmw_interposed = device->signalHostRmwInterposed();
+  const bool completion_on_own_barrier =
+      (DEBUG_CLR_GRAPH_COMPLETION_BARRIER == 1) ||
+      (DEBUG_CLR_GRAPH_COMPLETION_BARRIER >= 2 && host_rmw_interposed == 1);
+
+  // Where each consumed segment's completion signal ended up.  Instantiate-time only: an
+  // A/B on the placement is uninterpretable without knowing how many segments moved.
+  uint32_t n_completion_on_barrier = 0;
+  uint32_t n_completion_on_dispatch = 0;
+
   // PASS 0: Barrier-ROI collapse. Only runs in mode 0 (default) and only when
   // the graph is shallow (max_level<=4). Modes 1 (round-robin) and 2 (DFS)
   // never collapse. When collapse fires, every segment is folded onto stream 0
@@ -593,7 +613,8 @@ void GraphExecSegmented::BuildSyncPlan() {
     const bool completion_signal_needed = (hw_slot >= 0);
 
     auto& lastBatch = segBatch.packet_batches.back();
-    if (last_node_uncaptured && completion_signal_needed) {
+    const bool own_barrier_packet = last_node_uncaptured || completion_on_own_barrier;
+    if (own_barrier_packet && completion_signal_needed) {
       uint8_t* completion_barrier = device->CreateBarrierPacket();
       sync_plan_.barrier_packets.push_back(completion_barrier);
 
@@ -604,6 +625,7 @@ void GraphExecSegmented::BuildSyncPlan() {
       sync_plan_.patch_list.push_back(
           {completion_barrier, nullptr, hw_slot,
            amd::Device::HwEventPatch::kCompletionSignal});
+      ++n_completion_on_barrier;
     } else if (!lastBatch.dispatchPackets.empty() && completion_signal_needed) {
       // Safe to patch the last kernel dispatch directly
       uint8_t* last_pkt = lastBatch.dispatchPackets.back();
@@ -618,12 +640,21 @@ void GraphExecSegmented::BuildSyncPlan() {
       // the corner case where every node packet in this batch is disabled.
       lastBatch.fallbackBarrier = device->CreateBarrierPacket();
       sync_plan_.barrier_packets.push_back(lastBatch.fallbackBarrier);
+      ++n_completion_on_dispatch;
     }
 
     if (segment.segment_ids_edges.empty()) {
       sync_plan_.leaf_segment_ids.push_back(segment.id);
     }
   }
+
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "GraphSyncPlan: segments=%d hw_events=%d completion_on_barrier=%u "
+          "completion_on_dispatch=%u collapsed=%d completion_barrier_flag=%u "
+          "host_rmw_interposed=%d",
+          sync_plan_.num_segments, sync_plan_.num_hw_events, n_completion_on_barrier,
+          n_completion_on_dispatch, static_cast<int>(collapsed_to_single_stream_),
+          static_cast<unsigned>(DEBUG_CLR_GRAPH_COMPLETION_BARRIER), host_rmw_interposed);
 
   // Create the per-graph HW event signal pool once at instantiate time
   // (single-threaded here) and pre-create the signals, so the launch hot path

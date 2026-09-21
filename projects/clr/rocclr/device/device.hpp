@@ -2273,6 +2273,12 @@ class Device : public RuntimeObject {
   virtual void ApplyHwEventPatches(const std::vector<HwEventPatch>& patches,
                                    const std::vector<void*>& hw_events) const {}
 
+  //! May a tool loaded into this process perform a host read-modify-write atomic on a
+  //! completion signal this process puts on a packet?  1 yes, 0 no, -1 the backend cannot
+  //! answer (no such runtime query).  Asked, not cached: the answer is the tool's to
+  //! change, and a caller that caches it owns that decision.
+  virtual int signalHostRmwInterposed() const { return -1; }
+
   virtual const bool isFineGrainSupported() const {
     return (info().svmCapabilities_ & CL_DEVICE_SVM_ATOMICS) != 0 ? true : false;
   }
