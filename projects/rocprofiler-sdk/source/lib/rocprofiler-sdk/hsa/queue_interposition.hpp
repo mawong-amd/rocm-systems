@@ -277,6 +277,34 @@ wait_queue_hw_drained_locked(QueueState& state, uint64_t submit_pos, uint64_t de
 bool
 supports_queue_interposition();
 
+/**
+ * @brief Whether this SDK may host-RMW an application completion signal
+ *
+ * Answers HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW for the runtime.  The inline
+ * intercept path adds 1 to, and later subtracts 1 from, the completion signal of every
+ * kernel dispatch packet it observes; those are host read-modify-writes, and against a
+ * device resident value word they are unsound.
+ *
+ * Deliberately CONSERVATIVE: it consults only the terms of
+ * should_bypass_inline_intercept() that cannot change again for the life of the process.
+ * The dynamic terms -- the active consumer count and the completion monitor state -- can
+ * turn ON after the question has been answered (a tool starting a tracing context is
+ * exactly that), so letting them answer "no" would hand the producer a permission it
+ * loses moments later.
+ */
+bool
+host_rmw_on_completion_signals();
+
+/**
+ * @brief ToolsApiTable entry point for HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW
+ *
+ * Installed into the runtime's tools table by registration.cpp.  Records that a negative
+ * answer has been handed out, which is what makes a later arming of the inline path
+ * detectable rather than silently corrupting already-built producers.
+ */
+hsa_status_t
+query_signal_host_rmw_event(hsa_amd_tool_event_t event);
+
 void
 notify_queue_interposition_consumer_context_started(const context::context* ctx);
 

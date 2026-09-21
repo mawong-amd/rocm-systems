@@ -1665,8 +1665,45 @@ rocprofiler_set_api_table(const char* name,
             ROCP_INFO << "[queue-interposition] ROCPROFILER_QUEUE_INTERPOSITION="
                       << (enable_queue_interposition ? "true" : "false");
 
+            // Tell the HSA runtime, and through it any producer of device resident
+            // completion signals, whether we may host-RMW one.  Installed on BOTH
+            // branches: an absent slot means "a tool that predates the query", which the
+            // runtime cannot distinguish from "a tool that answers no", and the whole
+            // point of this gate is that the negative answer is authoritative.
+            //
+            // Guarded on the published size of the table rather than on the header we
+            // compiled against: this SDK can be loaded into an older runtime whose
+            // ToolsApiTable stops before this field, and writing past it would corrupt
+            // whatever follows.  minor_id carries sizeof(ToolsApiTable).
+            if(hsa_api_table->tools_ != nullptr)
+            {
+                constexpr size_t needed =
+                    offsetof(::ToolsApiTable, hsa_amd_tool_query_signal_host_rmw_fn) +
+                    sizeof(hsa_amd_tool_event);
+                if(hsa_api_table->tools_->version.minor_id >= needed)
+                {
+                    hsa_api_table->tools_->hsa_amd_tool_query_signal_host_rmw_fn =
+                        rocprofiler::hsa::queue_interposition::query_signal_host_rmw_event;
+                    ROCP_INFO << "[queue-interposition] installed "
+                                 "hsa_amd_tool_query_signal_host_rmw_fn";
+                }
+                else
+                {
+                    ROCP_WARNING
+                        << "[queue-interposition] HSA runtime predates "
+                           "HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW (ToolsApiTable is "
+                        << hsa_api_table->tools_->version.minor_id << " bytes, need " << needed
+                        << "); producers of device resident completion signals cannot be told "
+                           "about inline interposition and may abort under it";
+                }
+            }
+
             // (eventually) we will want to always install the intercepts so that dynamic enablement
             // of inline intercept can occur when conditions allow.
+            // ⚠ If that is implemented, see the INVARIANT comment on the ROCP_FATAL_IF in
+            // queue_interposition.cpp's interposition_init(): a producer that has already
+            // been told "no host RMW" has baked that answer into packets it cannot
+            // revisit, so arming late is not a free action.
             if(enable_queue_interposition)
                 rocprofiler::hsa::queue_interposition::interposition_init(
                     hsa_api_table->core_, enable_queue_interposition);

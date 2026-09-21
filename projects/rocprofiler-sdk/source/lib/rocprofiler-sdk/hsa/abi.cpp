@@ -97,6 +97,8 @@ ROCP_SDK_ENFORCE_ABI_VERSIONING(::FinalizerExtTable, 7);
 
 #if HSA_TOOLS_API_TABLE_STEP_VERSION == 0x00
 ROCP_SDK_ENFORCE_ABI_VERSIONING(::ToolsApiTable, 7);
+#elif HSA_TOOLS_API_TABLE_STEP_VERSION == 0x01
+ROCP_SDK_ENFORCE_ABI_VERSIONING(::ToolsApiTable, 8);
 #endif
 
 #if HSA_PC_SAMPLING_API_TABLE_STEP_VERSION == 0x00
@@ -392,6 +394,9 @@ ROCP_SDK_ENFORCE_ABI(::ToolsApiTable, hsa_amd_tool_scratch_event_free_start_fn, 
 ROCP_SDK_ENFORCE_ABI(::ToolsApiTable, hsa_amd_tool_scratch_event_free_end_fn, 4);
 ROCP_SDK_ENFORCE_ABI(::ToolsApiTable, hsa_amd_tool_scratch_event_async_reclaim_start_fn, 5);
 ROCP_SDK_ENFORCE_ABI(::ToolsApiTable, hsa_amd_tool_scratch_event_async_reclaim_end_fn, 6);
+#if HSA_TOOLS_API_TABLE_STEP_VERSION >= 0x01
+ROCP_SDK_ENFORCE_ABI(::ToolsApiTable, hsa_amd_tool_query_signal_host_rmw_fn, 7);
+#endif
 
 ROCP_SDK_ENFORCE_ABI(::PcSamplingExtTable, hsa_ven_amd_pcs_iterate_configuration_fn, 1);
 ROCP_SDK_ENFORCE_ABI(::PcSamplingExtTable, hsa_ven_amd_pcs_create_fn, 2);

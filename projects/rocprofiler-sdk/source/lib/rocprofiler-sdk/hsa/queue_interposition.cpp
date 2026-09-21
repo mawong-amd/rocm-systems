@@ -94,6 +94,13 @@ auto s_intercept_installed = std::atomic<bool>{false};  // installed (may not be
 auto s_intercept_active    = std::atomic<bool>{false};  // actively intercepting
 auto s_intercept_dynamic   = std::atomic<bool>{false};  // dynamically add queue states
 
+// Set once the runtime has been told, on our behalf, that nothing here will host-RMW an
+// application completion signal.  A producer is entitled to act on that answer
+// irreversibly -- CLR bakes the placement of a graph segment's completion signal into the
+// packets at graph instantiate time -- so this is the flag that makes a later arming of
+// the inline path a detectable error instead of silent corruption.
+auto s_host_rmw_answered_no = std::atomic<bool>{false};
+
 bool
 has_active_queue_interposition_consumers()
 {
@@ -1872,6 +1879,38 @@ supports_queue_interposition()
     return s_intercept_installed.load(std::memory_order_acquire);
 }
 
+bool
+host_rmw_on_completion_signals()
+{
+    // Only the terms of should_bypass_inline_intercept() that are settled for the life of
+    // the process.  has_active_queue_interposition_consumers() and the monitor state are
+    // deliberately NOT consulted: both are false on a freshly started server and become
+    // true when a tool starts tracing, which is precisely the moment the abort is
+    // observed today.  supports_attachment() is included because it is sticky true and is
+    // set before the "hsa" table is registered, and while it holds every inline wrapper
+    // passes through without touching a completion signal.
+    return s_intercept_installed.load(std::memory_order_acquire) &&
+           s_intercept_active.load(std::memory_order_acquire) &&
+           !registration::supports_attachment();
+}
+
+hsa_status_t
+query_signal_host_rmw_event(hsa_amd_tool_event_t event)
+{
+    if(event.query_signal_host_rmw == nullptr ||
+       event.query_signal_host_rmw->kind != HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+
+    const bool answer = host_rmw_on_completion_signals();
+    if(!answer) s_host_rmw_answered_no.store(true, std::memory_order_release);
+
+    event.query_signal_host_rmw->host_rmw_on_completion_signal = answer ? 1 : 0;
+
+    ROCP_INFO << "[queue-interposition] HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW -> "
+              << (answer ? "true" : "false");
+    return HSA_STATUS_SUCCESS;
+}
+
 namespace
 {
 void
@@ -2078,6 +2117,33 @@ interposition_init(CoreApiTable* core_table, bool enabled)
 
     // launch the completion-monitor thread that waits on in-flight completion signals
     start_completion_monitor();
+
+    // INVARIANT, load bearing outside this repository.  Once this process has answered
+    // HSA_AMD_SYSTEM_INFO_SIGNAL_HOST_RMW_INTERPOSED with "no", that answer must never
+    // become "yes".  A HIP graph instantiated under a "no" answer has its cross stream
+    // completion signal patched into a kernel dispatch packet's completion_signal slot,
+    // where the value word is device resident; the +1/-1 the inline path performs on it
+    // is a host read-modify-write, which x86 cannot promote to a PCIe atomic.  ROCr
+    // refuses it and aborts; a runtime without that guard loses the GPU's update
+    // silently.  Either way the graph is already built and nothing downstream can
+    // recover.
+    //
+    // This is not hypothetical: rocprofiler_force_configure() re-drives the "hsa" table
+    // registration through registration::late::invoke_register_propagation(), and that
+    // branch has no once-guard, so a process that started with no registered contexts
+    // can reach interposition_init() long after its graphs exist.
+    //
+    // If dynamic enablement of inline intercept is implemented (see the "(eventually) we
+    // will want to always install the intercepts" TODO in registration.cpp), THIS is the
+    // thing that has to be solved -- by renegotiating with the producer -- not deleted.
+    ROCP_FATAL_IF(enabled && s_host_rmw_answered_no.load(std::memory_order_acquire))
+        << "inline queue interposition armed after the HSA runtime was told, through "
+           "HSA_AMD_TOOL_EVENT_QUERY_SIGNAL_HOST_RMW, that no host read-modify-write "
+           "would be performed on application completion signals. Producers have "
+           "already committed device resident signals to dispatch packets on that "
+           "answer and cannot be renegotiated. Start this tool before the application "
+           "builds GPU work, or set DEBUG_CLR_GRAPH_COMPLETION_BARRIER=1 to force the "
+           "conservative producer side placement.";
 
     // mark that intercept has been activated
     s_intercept_active.store(enabled, std::memory_order_release);
