@@ -332,6 +332,35 @@ hipError_t Graph::ScheduleNodesIntoBatches() {
     return hipErrorInvalidValue;
   }
 
+  // A partitioner bug that places a node in two paths is invisible downstream: capture would
+  // form that node's packets twice and its kernel arguments would be allocated twice, which
+  // reads as a memory regression, not as a correctness failure. Equality here rules that out;
+  // an inequality names it. Costs one pass over the segments at instantiate.
+  {
+    size_t nodes_in_segments = 0;
+    std::unordered_set<Node> distinct;
+    size_t kernarg = 0;
+    for (const auto& seg : segments_) {
+      if (seg.child_graph_ptr != nullptr) continue;
+      nodes_in_segments += seg.nodes.size();
+      for (Node n : seg.nodes) {
+        distinct.insert(n);
+        if (n != nullptr && n->GraphCaptureEnabled()) kernarg += n->GetKerArgSize();
+      }
+    }
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[hipGraph] Partition: vertices=%zu nodes_in_segments=%zu distinct=%zu segments=%zu "
+            "kernarg_bytes=%zu partition=%u",
+            GetNodeCount(), nodes_in_segments, distinct.size(), segments_.size(), kernarg,
+            static_cast<uint32_t>(DEBUG_HIP_GRAPH_SEGMENT_PARTITION));
+    if (nodes_in_segments != distinct.size()) {
+      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+              "[hipGraph] PARTITION DUPLICATES NODES: %zu placements for %zu distinct nodes -- "
+              "their packets and kernel arguments are formed more than once",
+              nodes_in_segments, distinct.size());
+    }
+  }
+
   ClPrint(amd::LOG_DETAIL_DEBUG, amd::LOG_CODE,
           "[hipGraph] ScheduleNodesIntoBatches: Total nodes = %zu, total segments = %zu max "
           "dependency level = %d, max streams = %d",
@@ -341,18 +370,99 @@ hipError_t Graph::ScheduleNodesIntoBatches() {
 }
 
 // ================================================================================================
+// Longest-path level of every node, and the node-level interval each segment covers.
+// Concurrency questions are answered here and only here: a segment's dependency_level
+// counts segment hops, so two segments at different dependency levels can still be
+// executing simultaneously, and comparing the two numbering schemes is a units error.
+void Graph::ComputeNodeLevels() {
+  node_level_.clear();
+  segment_live_.assign(segments_.size(), {0, 0});
+
+  std::vector<Node> topo;
+  if (!TopologicalOrder(topo)) {
+    // A cycle; the caller reports it. Leave levels flat rather than looping.
+    for (Node n : vertices_) {
+      if (n != nullptr) node_level_[n] = 0;
+    }
+    return;
+  }
+  for (Node n : topo) {
+    int lvl = 0;
+    for (Node d : n->GetDependencies()) {
+      auto it = node_level_.find(d);
+      if (it != node_level_.end()) lvl = std::max(lvl, it->second + 1);
+    }
+    node_level_[n] = lvl;
+  }
+
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    int lo = INT_MAX, hi = 0;
+    for (Node n : segments_[i].nodes) {
+      auto it = node_level_.find(n);
+      if (it == node_level_.end()) continue;
+      lo = std::min(lo, it->second);
+      hi = std::max(hi, it->second);
+    }
+    if (lo == INT_MAX) lo = 0;
+    segment_live_[i] = {lo, std::max(lo, hi)};
+  }
+}
+
+// ================================================================================================
+bool Graph::SegmentsOverlap(int a, int b) const {
+  if (a < 0 || b < 0 || a >= static_cast<int>(segment_live_.size()) ||
+      b >= static_cast<int>(segment_live_.size())) {
+    return false;
+  }
+  return segment_live_[a].first <= segment_live_[b].second &&
+         segment_live_[b].first <= segment_live_[a].second;
+}
+
+// ================================================================================================
+int Graph::PeakLiveSegments(int dev_id) const {
+  if (segment_live_.size() != segments_.size() || segments_.empty()) return 0;
+  int max_level = 0;
+  for (const auto& iv : segment_live_) max_level = std::max(max_level, iv.second);
+  std::vector<int> delta(static_cast<size_t>(max_level) + 2, 0);
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    if (segments_[i].dev_id != dev_id) continue;
+    const int lo = segment_live_[i].first;
+    const int hi = segment_live_[i].second;
+    if (lo < 0 || hi < lo) continue;
+    ++delta[static_cast<size_t>(lo)];
+    --delta[static_cast<size_t>(hi) + 1];
+  }
+  int live = 0, peak = 0;
+  for (int v : delta) { live += v; peak = std::max(peak, live); }
+  return peak;
+}
+
+// ================================================================================================
 void Graph::ResolveSegmentDependencies() {
-  // Resolve dependencies within this graph
+  // Dependencies are derived from EVERY node of a segment, not just first_node.
+  //
+  // Reading only first_node is correct exactly while the partitioner cuts at every fork and
+  // every join, because then every non-first node of a segment has a single dependency and
+  // that dependency is its own predecessor inside the same segment. A mode that merges a
+  // fork into one of its branches breaks that precondition, and an interior node's external
+  // dependency would then vanish from the sync plan entirely -- a missing ordering edge, not
+  // a lost optimisation. Deriving from all nodes removes the dependence on the precondition.
+  //
+  // Intra-segment edges are skipped: a segment is dispatched in order on one stream, so they
+  // need no barrier and must not become self-dependencies (which would strand the segment at
+  // dependency_level -1 in the topological sort below).
+  size_t external_deps_from_interior = 0;
+
   for (size_t i = 0; i < segments_.size(); ++i) {
     auto& segment = segments_[i];
 
-    // Only check first node for incoming dependencies
-    if (segment.first_node != nullptr) {
-      const auto& dependencies = segment.first_node->GetDependencies();
+    // Use a set for O(1) duplicate detection instead of linear search on the vector
+    std::unordered_set<int> dep_set(segment.segment_ids_dependencies.begin(),
+                                    segment.segment_ids_dependencies.end());
 
-      // Use a set for O(1) duplicate detection instead of linear search on the vector
-      std::unordered_set<int> dep_set(segment.segment_ids_dependencies.begin(),
-                                      segment.segment_ids_dependencies.end());
+    for (const auto& node : segment.nodes) {
+      if (node == nullptr) continue;
+      const auto& dependencies = node->GetDependencies();
 
       for (const auto& dep_node : dependencies) {
         // Find which segment this dependency belongs to (within this graph)
@@ -368,17 +478,30 @@ void Graph::ResolveSegmentDependencies() {
             continue;  // Skip invalid segment ID
           }
 
+          // Internal to this segment: ordered by the in-order queue, no barrier needed.
+          if (dep_segment_id == static_cast<int>(i)) continue;
+
           // Add dependency if not already present (O(1) lookup)
           if (dep_set.insert(dep_segment_id).second) {
             segment.segment_ids_dependencies.push_back(dep_segment_id);
 
             // Also add this segment as an edge of the dependency segment
             segments_[dep_segment_id].segment_ids_edges.push_back(i);
+
+            if (node != segment.first_node) ++external_deps_from_interior;
           }
         }
       }
     }
   }
+
+  // The invariant this derivation exists to stop relying on, measured rather than assumed.
+  // A segment that spans neither a fork nor a join can only carry external dependencies on
+  // its first node, so at partition mode 0 this prints 0. A non-zero value is exactly the
+  // set of edges the segment-keyed derivation could not see.
+  ClPrint(amd::LOG_DETAIL_DEBUG, amd::LOG_CODE,
+          "[hipGraph] ResolveSegmentDependencies: segments=%zu external_deps_from_interior=%zu",
+          segments_.size(), external_deps_from_interior);
 
   // Recursively resolve dependencies in child graphs
   // When a parent segment depends on a segment containing a child graph node,
@@ -395,8 +518,277 @@ void Graph::ResolveSegmentDependencies() {
     }
   }
 
+  // Node-level intervals: the concurrency input for stream-pool sizing and assignment.
+  ComputeNodeLevels();
+
   // Calculate dependency levels and max_streams_ using topological sort
   CalculateSegmentTopoDependencyLevels();
+}
+
+// ================================================================================================
+int GraphExecSegmented::NodePos(Node n) const {
+  auto it = node_pos_.find(n);
+  return (it == node_pos_.end()) ? -1 : it->second;
+}
+
+// ================================================================================================
+int GraphExecSegmented::HwEventSlotFor(Node n) const {
+  if (n == nullptr) return -1;
+  auto it = sync_plan_.node_to_hw_event.find(n);
+  return (it == sync_plan_.node_to_hw_event.end()) ? -1 : it->second;
+}
+
+// ================================================================================================
+// The last AQL packet belonging to |n|, or nullptr when |n| cannot carry a completion signal
+// of its own. A node qualifies only if it was AQL-captured (an uncaptured node runs as an
+// ordinary command and owns no packet) and its range is non-empty (an EMPTY node is a pure
+// dependency point and contributes zero packets).
+uint8_t* GraphExecSegmented::LastPacketOfNode(int segment_id, Node n) const {
+  if (n == nullptr) return nullptr;
+  if (segment_id < 0 || segment_id >= static_cast<int>(segments_.size())) return nullptr;
+  auto sit = segmentBatches_.find(segment_id);
+  if (sit == segmentBatches_.end()) return nullptr;
+
+  // node_capture_status is indexed by position within the segment and is the live flag.
+  // (PacketBatch::NodeRange::captured is NOT: both construction sites pass three
+  // initialisers, so it is value-initialised false and read nowhere.)
+  const int idx = NodePos(n);
+  if (idx < 0) return nullptr;
+  const auto& status = sit->second.node_capture_status;
+  if (static_cast<size_t>(idx) >= status.size() || !status[idx]) return nullptr;
+
+  for (const auto& batch : sit->second.packet_batches) {
+    auto rit = batch.nodeToRangeIndex.find(n);
+    if (rit == batch.nodeToRangeIndex.end()) continue;
+    if (rit->second >= batch.nodeRanges.size()) return nullptr;
+    const auto& r = batch.nodeRanges[rit->second];
+    if (r.packetCount == 0) return nullptr;
+    const size_t last = r.startIndex + r.packetCount - 1;
+    if (last >= batch.dispatchPackets.size()) return nullptr;
+    return batch.dispatchPackets[last];
+  }
+  return nullptr;
+}
+
+// ================================================================================================
+// Decide, for every cross-stream segment dependency, WHICH node of the producer the consumer
+// actually has to wait on, and hence which nodes need a completion slot.
+//
+// Waiting on the producer segment's tail is always sufficient and is what the fork/join
+// partition produced; it is also what makes merging a fork into a branch pointless, because
+// the fork's other branches would then wait for the whole merged branch to finish. The node
+// a consumer truly depends on is the LATEST node of the producer segment any of the
+// consumer's nodes has an edge from -- latest, because a segment is one in-order stream, so
+// position k dominates every position below it.
+void GraphExecSegmented::ComputeProducerNodes() {
+  const size_t n_seg = segments_.size();
+  dep_producer_.assign(n_seg, {});
+  segment_producer_nodes_.assign(n_seg, {});
+  node_pos_.clear();
+  for (const auto& seg : segments_) {
+    for (size_t i = 0; i < seg.nodes.size(); ++i) {
+      node_pos_[seg.nodes[i]] = static_cast<int>(i);
+    }
+  }
+
+  // A tail signal rides the segment's last packet or a barrier appended after it; an
+  // interior signal has to ride the producing node's own dispatch packet. When
+  // DEBUG_CLR_DEVICE_ORDERING_EDGE == 1 the completion signal is deliberately kept OFF
+  // dispatch packets (so queue interceptors that rewrite dispatch packets cannot see it),
+  // which interior producers cannot honour -- so they are disabled in that configuration
+  // rather than silently violating it.
+  const bool interior_allowed =
+      (DEBUG_CLR_PP_MODE >= 1) && (DEBUG_CLR_DEVICE_ORDERING_EDGE != 1);
+  const bool redirect = (DEBUG_CLR_PP_MODE >= 2) && (DEBUG_CLR_DEVICE_ORDERING_EDGE != 1);
+
+  std::vector<std::unordered_set<Node>> seen(n_seg);
+  auto add_producer = [&](int seg_id, Node n) {
+    if (n != nullptr && seen[seg_id].insert(n).second) {
+      segment_producer_nodes_[seg_id].push_back(n);
+    }
+  };
+
+  for (size_t c = 0; c < n_seg; ++c) {
+    const auto& cons = segments_[c];
+
+    std::unordered_map<int, Node> latest;
+    for (Node n : cons.nodes) {
+      if (n == nullptr) continue;
+      for (Node d : n->GetDependencies()) {
+        auto it = node_to_segment_id_.find(d);
+        if (it == node_to_segment_id_.end()) continue;
+        const int p = it->second;
+        if (p < 0 || p >= static_cast<int>(n_seg) || p == static_cast<int>(c)) continue;
+        Node& slot = latest[p];
+        if (slot == nullptr || NodePos(d) > NodePos(slot)) slot = d;
+      }
+    }
+
+    for (const auto& [p, producer] : latest) {
+      const auto& prod = segments_[p];
+      // Same device AND same stream: the in-order queue orders them, no signal at all.
+      // Producers are at a strictly lower dependency level, hence dispatched earlier.
+      if (prod.dev_id == cons.dev_id && prod.stream_id == cons.stream_id) continue;
+
+      // An interior node can only carry the signal if it owns a patchable packet.
+      Node interior = nullptr;
+      if (interior_allowed && producer != nullptr && producer != prod.last_node &&
+          LastPacketOfNode(p, producer) != nullptr) {
+        interior = producer;
+      }
+
+      const Node eff = (redirect && interior != nullptr) ? interior : prod.last_node;
+      dep_producer_[c][p] = eff;
+      add_producer(p, eff);
+      // Mode 1 emits the interior signal but leaves consumers on the tail, so the interior
+      // signal is inert. That isolates "emitting is safe" from "redirecting is correct".
+      if (!redirect && interior != nullptr) add_producer(p, interior);
+    }
+  }
+
+  // Leaves still need their tail signalled so EnqueueSegmentedGraph can join them back to
+  // the launch stream.
+  // EnqueueSegmentedGraph joins a leaf back to the launch stream through ONE signal, the
+  // leaf's last_node. That is sound because a leaf segment has exactly one terminal node:
+  // a segment's nodes form a chain of real graph edges, and "leaf" means no node has a
+  // successor outside the segment, so the only node without a successor is the chain's end.
+  // The argument survives fork merging -- but it is an argument, so it is checked. A leaf
+  // with two terminal nodes would silently join on only one of them.
+  size_t multi_terminal_leaves = 0;
+  if (IsLeafNodeSyncRequired()) {
+    for (size_t i = 0; i < n_seg; ++i) {
+      if (!segments_[i].segment_ids_edges.empty()) continue;
+      size_t terminals = 0;
+      for (Node n : segments_[i].nodes) {
+        if (n != nullptr && n->GetEdges().empty()) ++terminals;
+      }
+      if (terminals > 1) ++multi_terminal_leaves;
+      add_producer(static_cast<int>(i), segments_[i].last_node);
+    }
+  }
+  if (multi_terminal_leaves != 0) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] LEAF HAS MULTIPLE TERMINAL NODES: %zu leaf segment(s) -- the launch "
+            "stream joins on last_node only and will not wait for the others",
+            multi_terminal_leaves);
+  }
+
+  // Deterministic slot numbering: node order within the segment.
+  for (size_t i = 0; i < n_seg; ++i) {
+    auto& v = segment_producer_nodes_[i];
+    std::stable_sort(v.begin(), v.end(),
+                     [this](Node a, Node b) { return NodePos(a) < NodePos(b); });
+  }
+}
+
+// ================================================================================================
+Node GraphExecSegmented::ProducerFor(int consumer_seg, int producer_seg) const {
+  if (consumer_seg >= 0 && consumer_seg < static_cast<int>(dep_producer_.size())) {
+    auto it = dep_producer_[consumer_seg].find(producer_seg);
+    if (it != dep_producer_[consumer_seg].end() && it->second != nullptr) return it->second;
+  }
+  if (producer_seg >= 0 && producer_seg < static_cast<int>(segments_.size())) {
+    return segments_[producer_seg].last_node;
+  }
+  return nullptr;
+}
+
+// ================================================================================================
+// Re-derive, from the materialised plan alone, the ordering each cross-segment graph edge
+// actually receives, and report the ones left uncovered.
+//
+// This deliberately does NOT reuse dep_producer_ or the PASS 2 reduction: it reads the
+// emitted waits (effective_barrier_deps_), the emitted signals (node_to_hw_event) and the
+// stream assignment, and asks the question the hardware asks. Two things make an edge
+// u -> v safe, and nothing else does:
+//   (a) u's segment and v's segment are the same, or are on the same (device, stream) with
+//       u's segment dispatched earlier -- the in-order queue orders them; or
+//   (b) somewhere at or before v's segment on v's stream, a wait was emitted on a node of
+//       u's segment at a position >= u's, and that node emits a completion signal.
+// It can fail: dropping a wait, redirecting one to too early a node, or emitting a signal
+// on a node nobody patched all show up here as a non-zero count.
+size_t GraphExecSegmented::AuditSyncPlan() const {
+  // Dispatch order: level by level, in segments_per_level_ order -- the same walk
+  // EnqueueSegmentedGraph performs.
+  std::vector<int> order;
+  order.reserve(segments_.size());
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto it = segments_per_level_.find(level);
+    if (it == segments_per_level_.end()) continue;
+    for (int seg_id : it->second) {
+      if (seg_id >= 0 && seg_id < static_cast<int>(segments_.size())) order.push_back(seg_id);
+    }
+  }
+  std::vector<int> dispatch_rank(segments_.size(), -1);
+  for (size_t i = 0; i < order.size(); ++i) dispatch_rank[order[i]] = static_cast<int>(i);
+
+  auto stream_key = [](int dev_id, int stream_id) -> uint64_t {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(dev_id)) << 32) |
+           static_cast<uint32_t>(stream_id);
+  };
+
+  // Replay dispatch, accumulating per stream: producer segment -> highest node position this
+  // stream is known to be ordered after. Snapshot the state as each segment starts, because
+  // a segment's own barriers precede its own nodes.
+  std::unordered_map<uint64_t, std::unordered_map<int, int>> waited;
+  std::vector<std::unordered_map<int, int>> covered_at_start(segments_.size());
+
+  for (int seg_id : order) {
+    const auto& seg = segments_[seg_id];
+    auto& w = waited[stream_key(seg.dev_id, seg.stream_id)];
+    for (const auto& [dep_id, pnode] : effective_barrier_deps_[seg_id]) {
+      if (HwEventSlotFor(pnode) < 0) continue;  // no signal => this wait orders nothing
+      const int ppos = NodePos(pnode);
+      auto it = w.find(dep_id);
+      if (it == w.end()) {
+        w.emplace(dep_id, ppos);
+      } else {
+        it->second = std::max(it->second, ppos);
+      }
+    }
+    covered_at_start[seg_id] = w;
+    // Everything this segment runs is also ordered after everything its own segment's
+    // in-order stream already ran, which the (a) rule below covers directly.
+  }
+
+  size_t uncovered = 0, checked = 0;
+  int first_u = -1, first_v = -1;
+  for (size_t v_seg = 0; v_seg < segments_.size(); ++v_seg) {
+    const auto& cons = segments_[v_seg];
+    for (Node v : cons.nodes) {
+      if (v == nullptr) continue;
+      for (Node u : v->GetDependencies()) {
+        auto it = node_to_segment_id_.find(u);
+        if (it == node_to_segment_id_.end()) continue;
+        const int u_seg = it->second;
+        if (u_seg < 0 || u_seg >= static_cast<int>(segments_.size())) continue;
+        if (u_seg == static_cast<int>(v_seg)) continue;  // same segment, in-order
+        ++checked;
+        const auto& prod = segments_[u_seg];
+        // (a) same in-order queue, producer dispatched first.
+        if (prod.dev_id == cons.dev_id && prod.stream_id == cons.stream_id &&
+            dispatch_rank[u_seg] >= 0 && dispatch_rank[u_seg] < dispatch_rank[v_seg]) {
+          continue;
+        }
+        // (b) a wait on a node of u's segment at or past u.
+        const auto& cov = covered_at_start[v_seg];
+        auto cit = cov.find(u_seg);
+        if (cit != cov.end() && cit->second >= NodePos(u)) continue;
+        ++uncovered;
+        if (first_u < 0) { first_u = u_seg; first_v = static_cast<int>(v_seg); }
+      }
+    }
+  }
+
+  if (uncovered != 0) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] SYNC AUDIT FAILED: %zu of %zu cross-segment edges have NO ordering "
+            "(first: segment %d -> segment %d) -- consumers will run before their producers",
+            uncovered, checked, first_u, first_v);
+  }
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "[hipGraph] SyncAudit: cross_segment_edges=%zu uncovered=%zu", checked, uncovered);
+  return uncovered;
 }
 
 // ================================================================================================
@@ -408,13 +800,14 @@ void GraphExecSegmented::BuildSyncPlan() {
   sync_plan_.patch_list.clear();
   sync_plan_.barrier_packets.clear();
   sync_plan_.leaf_segment_ids.clear();
-  sync_plan_.seg_to_hw_event.assign(segments_.size(), -1);
+  sync_plan_.node_to_hw_event.clear();
   sync_plan_.num_hw_events = 0;
 
   auto* device = g_devices[captureDeviceId_]->devices()[0];
 
   uint32_t n_completion_on_barrier = 0;
   uint32_t n_completion_on_dispatch = 0;
+  uint32_t n_orphan_slots = 0;
 
   // PASS 0: Barrier-ROI collapse. Only runs in mode 0 (default) and only when
   // the graph is shallow (max_level<=4). Modes 1 (round-robin) and 2 (DFS)
@@ -436,11 +829,17 @@ void GraphExecSegmented::BuildSyncPlan() {
   // signal is consumed — cross-device/stream successor, or leaf when
   // leaf-sync is required. Same-stream successors are ordered by the
   // in-order queue and need no signal.
-  // needs_completion_signal is pre-computed by PrecomputeStreamAssignment()
-  // using the same criteria, so we reuse it directly.
+  //
+  // One slot per PRODUCING NODE rather than per segment. ComputeProducerNodes applies the
+  // same cross-stream/leaf criteria needs_completion_signal does, and when the partitioner
+  // cuts at every fork the only producing node of a segment is its last_node, so the
+  // numbering is identical to the per-segment one.
+  ComputeProducerNodes();
   for (size_t i = 0; i < segments_.size(); ++i) {
-    if (segments_[i].needs_completion_signal) {
-      sync_plan_.seg_to_hw_event[i] = sync_plan_.num_hw_events++;
+    for (Node producer : segment_producer_nodes_[i]) {
+      if (producer == nullptr) continue;
+      if (sync_plan_.node_to_hw_event.count(producer) != 0) continue;
+      sync_plan_.node_to_hw_event[producer] = sync_plan_.num_hw_events++;
     }
   }
 
@@ -456,19 +855,36 @@ void GraphExecSegmented::BuildSyncPlan() {
   // level-0 dependencies and land on the same stream: only the first needs the
   // dep barrier; the second inherits the ordering for free.
   //
-  // effective_barrier_deps[seg.id] holds the minimal set of cross-stream
-  // producers each segment must still wait on. Default to the full cross-stream
-  // set (safe for any segment not reached by the dispatch-order walk below),
-  // then reduce. NOTE: a segment's id equals its position in segments_ (ids are
-  // assigned sequentially at creation and pushed in order). The whole sync plan
-  // relies on this (e.g. segments_[dep_id]), so assert it once and index
-  // effective_barrier_deps by segment.id consistently below.
-  std::vector<std::vector<int>> effective_barrier_deps(segments_.size());
+  // ⛔ THE REDUCTION IS NODE-GRANULAR, NOT SEGMENT-GRANULAR. Memoising a bare "this stream
+  // already waited on segment P" is sound only while P has exactly one externally observable
+  // producer point -- its tail -- because waiting on the tail dominates all of P. Once a
+  // consumer may be redirected to an INTERIOR node of P, that premise is false: an earlier
+  // same-stream segment may have waited on P's node at position i while this consumer needs
+  // position j > i. A bare seen-bit then drops a wait that is still required, the consumer
+  // runs before its producer, and reading an unwritten pointer or gather index faults the
+  // GPU with MEMORY_APERTURE_VIOLATION. So the memo stores the MAXIMUM producer-node
+  // position waited on, and a dep is dropped only when that maximum already dominates the
+  // position now needed. Position dominance is exactly the in-order-queue property: a
+  // segment is dispatched in order on one stream, so node k implies every node below k.
+  //
+  // effective_barrier_deps_[seg.id] holds the (producer segment, producer node) waits each
+  // segment must still emit. NOTE: a segment's id equals its position in segments_ (ids are
+  // assigned sequentially at creation and pushed in order); the whole sync plan relies on it.
+  effective_barrier_deps_.assign(segments_.size(), {});
   {
-    // Per-stream set of producer segments already waited on, keyed by
-    // (dev_id, stream_id) packed into one 64-bit value. Walk segments in the
-    // exact dispatch order used by EnqueueSegmentedGraph.
-    std::unordered_map<uint64_t, std::unordered_set<int>> stream_waited_deps;
+    // Two diagnostic settings bracket the reduction so a failure can be ATTRIBUTED to it
+    // rather than argued about:
+    //   3  no reduction at all -- strictly more barriers, never fewer.
+    //   4  the old SEGMENT-granular reduction, deliberately restored. It is unsound with
+    //      interior producers and is here only so that the fault it causes can be produced
+    //      on demand and shown to disappear at mode 2. ⛔ Never a shipping setting.
+    const bool dedup = (DEBUG_CLR_PP_MODE != 3);
+    const bool dedup_ignores_position = (DEBUG_CLR_PP_MODE == 4);
+
+    // Per-stream memo: producer segment -> highest producer-node position already waited on.
+    // Keyed by (dev_id, stream_id) packed into one 64-bit value. Walk segments in the exact
+    // dispatch order used by EnqueueSegmentedGraph.
+    std::unordered_map<uint64_t, std::unordered_map<int, int>> stream_waited_deps;
     auto stream_key = [](int dev_id, int stream_id) -> uint64_t {
       return (static_cast<uint64_t>(static_cast<uint32_t>(dev_id)) << 32) |
              static_cast<uint32_t>(stream_id);
@@ -483,7 +899,7 @@ void GraphExecSegmented::BuildSyncPlan() {
         const auto& seg = segments_[seg_id];
         auto& waited = stream_waited_deps[stream_key(seg.dev_id, seg.stream_id)];
 
-        std::vector<int>& reduced = effective_barrier_deps[seg_id];
+        auto& reduced = effective_barrier_deps_[seg_id];
         reduced.clear();
         for (int dep_id : seg.segment_ids_dependencies) {
           if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
@@ -492,11 +908,24 @@ void GraphExecSegmented::BuildSyncPlan() {
           if (dep_seg.dev_id == seg.dev_id && dep_seg.stream_id == seg.stream_id) {
             continue;
           }
-          // Cross-stream dep: emit a wait only if no earlier same-stream segment
-          // has waited for this producer yet. insert() returns true on first add.
-          if (waited.insert(dep_id).second) {
-            reduced.push_back(dep_id);
+          Node pnode = ProducerFor(seg_id, dep_id);
+          if (pnode == nullptr) pnode = dep_seg.last_node;
+          const int ppos = NodePos(pnode);
+
+          auto it = waited.find(dep_id);
+          // ppos < 0 means the node is not in any segment, which should be impossible;
+          // never dedup on it rather than treating an unknown position as dominant.
+          if (dedup && it != waited.end() &&
+              (dedup_ignores_position || (ppos >= 0 && it->second >= ppos))) {
+            continue;
           }
+
+          if (it == waited.end()) {
+            waited.emplace(dep_id, ppos);
+          } else {
+            it->second = std::max(it->second, ppos);
+          }
+          reduced.push_back({dep_id, pnode});
         }
       }
     }
@@ -512,8 +941,8 @@ void GraphExecSegmented::BuildSyncPlan() {
   // hw_event slot indices computed in PASS 1.
   for (const auto& segment : segments_) {
     // Minimal cross-stream/device dependency set computed in PASS 2 (redundant
-    // same-stream barriers already removed).
-    const std::vector<int>& barrier_dep_indices = effective_barrier_deps[segment.id];
+    // same-stream barriers already removed). Each entry names the producer NODE to wait on.
+    const std::vector<std::pair<int, Node>>& barrier_deps = effective_barrier_deps_[segment.id];
 
     auto segBatchIt = segmentBatches_.find(segment.id);
     if (segBatchIt == segmentBatches_.end()) {
@@ -533,8 +962,8 @@ void GraphExecSegmented::BuildSyncPlan() {
     // Optimization: when there is exactly 1 dependency and the first captured
     // packet is an ext kernel dispatch, embed the dep_signal directly into
     // that packet instead of creating a separate barrier.
-    if (!barrier_dep_indices.empty()) {
-      int num_deps = static_cast<int>(barrier_dep_indices.size());
+    if (!barrier_deps.empty()) {
+      int num_deps = static_cast<int>(barrier_deps.size());
       bool use_ext_dep = false;
       if (num_deps == 1 && !firstBatch.dispatchPackets.empty()) {
         const uint8_t* pkt = firstBatch.dispatchPackets[0];
@@ -554,7 +983,7 @@ void GraphExecSegmented::BuildSyncPlan() {
         // hw_event_index uses the compact slot; dep producer always has one (PASS 1).
         sync_plan_.patch_list.push_back(
             {first_dispatch, nullptr,
-             sync_plan_.seg_to_hw_event[barrier_dep_indices[0]],
+             HwEventSlotFor(barrier_deps[0].second),
              amd::Device::HwEventPatch::kExtDispatchDepSignal});
       } else {
         int barrier_count = (num_deps + 4) / 5;
@@ -568,7 +997,7 @@ void GraphExecSegmented::BuildSyncPlan() {
           for (int d = start_dep; d < end_dep; ++d) {
             sync_plan_.patch_list.push_back(
                 {barrier_pkt, nullptr,
-                 sync_plan_.seg_to_hw_event[barrier_dep_indices[d]],
+                 HwEventSlotFor(barrier_deps[d].second),
                  d - start_dep});
           }
 
@@ -590,15 +1019,49 @@ void GraphExecSegmented::BuildSyncPlan() {
     bool last_node_uncaptured = segBatch.has_uncaptured_nodes &&
         !segment.nodes.empty() && !segBatch.node_capture_status.back();
 
+    // Interior producers carry their own completion signal on their own last packet. The
+    // patch is keyed by packet POINTER, so position within the batch is irrelevant and no
+    // mid-batch insertion is needed. Without this, a consumer of an early node of a merged
+    // segment would have to wait for the whole segment -- the false dependency that makes
+    // merging a fork into a branch cost more than it saves.
+    // LastPacketOfNode was already non-null for these nodes when PASS 1 chose them; the
+    // barrier prepend above shifts startIndex and dispatchPackets by the same amount, so it
+    // stays non-null. A null here would mean a slot with no emitter, i.e. a consumer that
+    // waits forever, so it is counted rather than ignored.
+    std::unordered_set<const uint8_t*> interior_signal_packets;
+    for (Node producer : segment_producer_nodes_[segment.id]) {
+      if (producer == nullptr || producer == segment.last_node) continue;
+      const int islot = HwEventSlotFor(producer);
+      uint8_t* pkt = LastPacketOfNode(segment.id, producer);
+      if (islot < 0 || pkt == nullptr) {
+        ++n_orphan_slots;
+        continue;
+      }
+      sync_plan_.patch_list.push_back(
+          {pkt, nullptr, islot, amd::Device::HwEventPatch::kCompletionSignal});
+      interior_signal_packets.insert(pkt);
+      ++n_completion_on_dispatch;
+    }
+
     // hw_slot >= 0 => some consumer observes this signal (set by PASS 1).
     // Otherwise skip both the completion barrier packet and its patch entry.
-    const int hw_slot = sync_plan_.seg_to_hw_event[segment.id];
+    const int hw_slot = HwEventSlotFor(segment.last_node);
     const bool completion_signal_needed = (hw_slot >= 0);
 
     auto& lastBatch = segBatch.packet_batches.back();
     // A completion signal on a dispatch packet is exposed to queue interceptors that rewrite
     // dispatch packets; on its own barrier packet it is not.
-    const bool own_barrier_packet = last_node_uncaptured || (DEBUG_CLR_DEVICE_ORDERING_EDGE == 1);
+    // ⛔ Two completion patches on ONE packet silently lose one of them: ApplyHwEventPatches
+    // writes completion_signal unconditionally, so the later patch overwrites the earlier and
+    // whoever waits on the overwritten signal deadlocks. The tail's carrier is the last packet
+    // of the last batch, and an interior producer can OWN that packet whenever the segment's
+    // own last_node contributes none -- an EMPTY node is captured but has packetCount 0. Give
+    // the tail its own barrier packet in that case instead.
+    const bool tail_packet_taken =
+        !lastBatch.dispatchPackets.empty() &&
+        interior_signal_packets.count(lastBatch.dispatchPackets.back()) != 0;
+    const bool own_barrier_packet =
+        last_node_uncaptured || tail_packet_taken || (DEBUG_CLR_DEVICE_ORDERING_EDGE == 1);
     if (own_barrier_packet && completion_signal_needed) {
       uint8_t* completion_barrier = device->CreateBarrierPacket();
       sync_plan_.barrier_packets.push_back(completion_barrier);
@@ -631,6 +1094,49 @@ void GraphExecSegmented::BuildSyncPlan() {
     if (segment.segment_ids_edges.empty()) {
       sync_plan_.leaf_segment_ids.push_back(segment.id);
     }
+  }
+
+  // ApplyHwEventPatches indexes hw_events[patch.hw_event_index] with NO bounds check
+  // (rocdevice.cpp), so a slot-space desync is a garbage hsa_signal_t written into a
+  // barrier -- a hang or an aperture violation, never a diagnosable failure. Turn it into
+  // one here. This can fail: a wrong producer-node mapping shows up either as a size
+  // mismatch or as an out-of-range patch index.
+  int bad_patches = 0;
+  for (const auto& patch : sync_plan_.patch_list) {
+    if (patch.hw_event_index < 0 || patch.hw_event_index >= sync_plan_.num_hw_events) {
+      ++bad_patches;
+    }
+  }
+  if (bad_patches != 0 || n_orphan_slots != 0 ||
+      static_cast<int>(sync_plan_.node_to_hw_event.size()) != sync_plan_.num_hw_events) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] SyncPlan SLOT DESYNC: %zu producer nodes for %d slots, %d patch(es) "
+            "outside [0,%d), %u slot(s) with no emitting packet",
+            sync_plan_.node_to_hw_event.size(), sync_plan_.num_hw_events, bad_patches,
+            sync_plan_.num_hw_events, n_orphan_slots);
+  }
+
+  {
+    size_t prod_total = 0, prod_interior = 0, seg_multi = 0, waits = 0;
+    for (size_t i = 0; i < segments_.size(); ++i) {
+      const size_t k = segment_producer_nodes_[i].size();
+      prod_total += k;
+      if (k > 1) ++seg_multi;
+      for (Node pnode : segment_producer_nodes_[i]) {
+        if (pnode != nullptr && pnode != segments_[i].last_node) ++prod_interior;
+      }
+      waits += effective_barrier_deps_[i].size();
+    }
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[hipGraph] Producers: total=%zu interior=%zu segments_with_multiple=%zu "
+            "emitted_waits=%zu pp_mode=%u partition=%u",
+            prod_total, prod_interior, seg_multi, waits,
+            static_cast<uint32_t>(DEBUG_CLR_PP_MODE),
+            static_cast<uint32_t>(DEBUG_HIP_GRAPH_SEGMENT_PARTITION));
+  }
+
+  if (DEBUG_HIP_GRAPH_SYNC_AUDIT != 0) {
+    AuditSyncPlan();
   }
 
   ClPrint(amd::LOG_INFO, amd::LOG_CODE,
@@ -719,6 +1225,24 @@ void Graph::CalculateSegmentTopoDependencyLevels() {
   // Calculate max_streams_ based on maximum parallelism at any dependency level
   for (const auto& level_segments : segments_per_level_) {
     max_streams_ = std::max(max_streams_, static_cast<int>(level_segments.second.size()));
+  }
+
+  // A segment left at level -1 never reached in-degree 0, i.e. the SEGMENT graph has a
+  // cycle. It is then absent from segments_per_level_, so EnqueueSegmentedGraph never
+  // dispatches it and BuildSyncPlan's PASS 2 never visits it -- a graph that silently
+  // drops work and deadlocks on the missing signal. Path decomposition of a DAG cannot
+  // produce this, and neither can merging a fork into a chain of its own successors, but
+  // it is the failure mode any future partitioning change would hit first, so it is
+  // checked rather than argued. This prints nothing when the partition is sound.
+  size_t unreached = 0;
+  for (const auto& seg : segments_) {
+    if (seg.dependency_level < 0) ++unreached;
+  }
+  if (unreached != 0) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] SEGMENT CYCLE: %zu of %zu segments never reached in-degree 0 -- they "
+            "will never be dispatched and every consumer of them will deadlock",
+            unreached, segments_.size());
   }
 }
 
@@ -856,7 +1380,19 @@ hipError_t Graph::FindPathsDFS(Node start, std::vector<Node>& current_path,
     // Check if this is a join node (multiple incoming dependencies)
     bool is_join = dependencies.size() > 1;
 
-    if (is_fork || is_join) {
+    // A fork cuts its segment only because the segment's completion signal rides its LAST
+    // packet, so a consumer of the fork would otherwise have to wait for everything after
+    // it. Per-producer completion signals remove that reason, so at partition modes >= 1 a
+    // pure fork stops cutting and is merged into one of its branches.
+    //
+    // A JOIN always cuts. Its dependency barriers are prepended to the segment's FIRST
+    // packet batch, so a join that started mid-segment would have its wait hoisted ahead of
+    // unrelated earlier work -- correct, but it would serialise the merged segment behind
+    // the join's producers. Mid-batch dependency barriers would be needed to lift this;
+    // they are not implemented, so the cut stands.
+    const bool fork_cuts = is_fork && (DEBUG_HIP_GRAPH_SEGMENT_PARTITION == 0);
+
+    if (fork_cuts || is_join) {
       // Save current path as a separate segment
       if (!current_path.empty()) {
         Node saved_join_node = nullptr;
@@ -874,27 +1410,63 @@ hipError_t Graph::FindPathsDFS(Node start, std::vector<Node>& current_path,
         }
         current_path.clear();
 
-        // For nodes that are both fork and join, save them as their own segment
-        if (saved_join_node != nullptr && is_fork) {
+        // For nodes that are both fork and join, save them as their own segment -- but only
+        // while the fork still cuts. Otherwise the node starts a segment (it is a join) and
+        // carries on into one successor rather than being isolated.
+        if (saved_join_node != nullptr && fork_cuts) {
           std::vector<Node> fork_join_segment = {saved_join_node};
           savePath(std::move(fork_join_segment), saved_join_node->GetDeviceId());
         }
 
         // Put the join node back in current_path for further traversal
-        // But not if it's also a fork node, because we'll traverse branches separately
-        if (saved_join_node != nullptr && !is_fork) {
+        // But not if it's also a CUTTING fork node, because we'll traverse branches separately
+        if (saved_join_node != nullptr && !fork_cuts) {
           current_path.push_back(saved_join_node);
         }
       }
-
-      // Traverse each branch until it hits a join
-      for (int i = static_cast<int>(edges.size()) - 1; i >= 0; --i) {
-        st.push_back(edges[static_cast<size_t>(i)]);
-      }
-    } else if (edges.size() == 1) {
-      // Single edge - continue on same path
-      st.push_back(edges[0]);
     }
+
+    // Traverse the successors. Hoisted out of the cut block above because a fork that does
+    // not cut still has to enqueue its successors, and pushing all edges in reverse order is
+    // identical to the previous single-edge case when there is exactly one edge.
+    //
+    // WHICH successor continues the current path decides whether a non-cutting fork saves
+    // anything. The stack pops last-pushed first, so the chosen successor is pushed LAST.
+    //   mode 1: edges[0], i.e. capture order.
+    //   mode 2: the successor whose fork/join-free run carries the most WORK. Work, not node
+    //           count, because the boundary worth deleting is the one on the rate-determining
+    //           branch; the weight is the launch thread count, the same quantity the chain
+    //           assigner's node_work uses, so partitioner and assigner optimise for the same
+    //           thing. MEASURED on DSV4: 269 of 271 forks have a successor that IS a join,
+    //           so continuing into edges[0] blindly absorbs nothing on most of them.
+    size_t continue_idx = 0;
+    if (!fork_cuts && is_fork && DEBUG_HIP_GRAPH_SEGMENT_PARTITION >= 2) {
+      size_t best_len = 0;
+      for (size_t e = 0; e < edges.size(); ++e) {
+        size_t len = 0, steps = 0;
+        Node walk = edges[e];
+        while (walk != nullptr && steps < 4096) {
+          if (walk->GetDependencies().size() > 1) break;              // a join cuts before it
+          if (visited.find(walk->GetID()) != visited.end()) break;
+          size_t w = 1;
+          if (walk->GetType() == hipGraphNodeTypeKernel) {
+            const size_t th = static_cast<GraphKernelNode*>(walk)->GetLaunchThreadCount();
+            if (th > 0) w = th;
+          }
+          len += w;
+          ++steps;
+          const auto& next = walk->GetEdges();
+          if (next.size() != 1) break;                                // a fork ends the run
+          walk = next[0];
+        }
+        if (len > best_len) { best_len = len; continue_idx = e; }
+      }
+    }
+    for (int i = static_cast<int>(edges.size()) - 1; i >= 0; --i) {
+      if (static_cast<size_t>(i) == continue_idx) continue;
+      st.push_back(edges[static_cast<size_t>(i)]);
+    }
+    if (!edges.empty()) st.push_back(edges[continue_idx]);
 
     // Save any remaining path (handles leaf nodes and leaf join nodes)
     if (!current_path.empty() && edges.size() == 0) {
@@ -1252,6 +1824,42 @@ hipError_t GraphExecSegmented::FindStreamsReqPerDevForSegments() {
       }
     }
 
+    // ⛔ The per-level segment count is a LOWER BOUND on concurrency, and merging makes the
+    // gap large. A merged segment absorbs its fork, so the fork's other branches become
+    // dependants of the merged segment and land at the NEXT dependency level -- even though
+    // they can start as soon as the fork's own node signals, which node-granular sync lets
+    // them do. Sized by level population, the pool then shrinks exactly when the graph needs
+    // it most, and two segments that genuinely overlap get the same stream and serialise.
+    // Size from node-level LIVENESS instead, which counts segments that can be executing at
+    // the same instant. Gated: at partition mode 0 this would also change stock sizing,
+    // which is a separate question and must not ride along on the default path.
+    if (DEBUG_HIP_GRAPH_SEGMENT_PARTITION != 0) {
+      for (const auto& [dev_id, count] : streams_per_dev_at_level) {
+        (void)count;
+        const int live = graphExec->PeakLiveSegments(dev_id);
+        max_streams_dev_[dev_id] = std::max(max_streams_dev_[dev_id], live);
+      }
+    }
+
+    {
+      // Starts-vs-live at a glance. Equal means the old lower bound was tight here and this
+      // change buys nothing; live > starts is exactly the concurrency merging was losing.
+      int max_start = 0;
+      for (const auto& [lvl, ids] : graphExec->segments_per_level_) {
+        (void)lvl;
+        max_start = std::max(max_start, static_cast<int>(ids.size()));
+      }
+      std::set<int> devs;
+      for (const auto& s : graphExec->segments_) devs.insert(s.dev_id);
+      for (int d : devs) {
+        ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+                "[hipGraph] Concurrency: dev=%d peak_starts_any_level=%d peak_live=%d "
+                "segments=%zu partition=%u",
+                d, max_start, graphExec->PeakLiveSegments(d), graphExec->segments_.size(),
+                static_cast<uint32_t>(DEBUG_HIP_GRAPH_SEGMENT_PARTITION));
+      }
+    }
+
     for (const auto& segment : graphExec->segments_) {
       if (segment.child_graph_ptr != nullptr) {
         auto childGraphExec = dynamic_cast<GraphExecBase*>(segment.child_graph_ptr);
@@ -1280,29 +1888,148 @@ hipError_t GraphExecSegmented::FindStreamsReqPerDevForSegments() {
 }
 
 // ================================================================================================
-void GraphExecSegmented::RoundRobinStreamAssignment() {
-  // max_streams_dev_ represents the total stream-slot count uniformly per device;
-  // CreateStreams() does not adjust it. The capture device's slot 0 instead comes
-  // from the launch stream (same-device) or EnsureCrossDeviceStream() (cross-device).
-  auto getPoolSize = [&](int dev_id) -> size_t {
-    auto it = max_streams_dev_.find(dev_id);
-    return (it != max_streams_dev_.end() && it->second > 0)
-               ? static_cast<size_t>(it->second) : 1;
-  };
+// max_streams_dev_ represents the total stream-slot count uniformly per device;
+// CreateStreams() does not adjust it. The capture device's slot 0 instead comes
+// from the launch stream (same-device) or EnsureCrossDeviceStream() (cross-device).
+// Init() caps this against DEBUG_HIP_FORCE_GRAPH_QUEUES before assignment runs.
+size_t GraphExecSegmented::GetStreamPoolSize(int dev_id) const {
+  auto it = max_streams_dev_.find(dev_id);
+  return (it != max_streams_dev_.end() && it->second > 0) ? static_cast<size_t>(it->second) : 1;
+}
+
+// ================================================================================================
+// Shared placement core for every level-framed strategy.
+//
+// Two segments conflict when giving them the same stream would serialise work that could
+// otherwise overlap. Which segments those are depends on the partition:
+//   partition 0  same dependency level. Every segment is one fork/join-free run, so a
+//                segment's whole lifetime is its level, and this is what stock round-robin
+//                assumes. Reproduced exactly, so the default path is untouched.
+//   partition >0 overlapping node-level intervals. A merged segment absorbs its fork, so
+//                the fork's other branches sit at the NEXT dependency level while running
+//                CONCURRENTLY with it; level equality no longer describes concurrency and
+//                using it hands them the same stream.
+void GraphExecSegmented::ComputeRoundRobinAssignment(std::vector<int>& out) const {
+  out.assign(segments_.size(), -1);
+  const bool by_interval = (DEBUG_HIP_GRAPH_SEGMENT_PARTITION != 0);
 
   for (int level = 0; level <= max_dependency_level_; ++level) {
     auto it = segments_per_level_.find(level);
     if (it == segments_per_level_.end()) continue;
 
-    // Per-device round-robin counters, reset per level so parallel segments on
-    // the same device spread evenly across that device's stream pool.
-    std::unordered_map<int, size_t> dev_idx;
-
     for (int seg_id : it->second) {
-      if (seg_id >= 0 && seg_id < static_cast<int>(segments_.size())) {
-        auto& seg = segments_[seg_id];
-        seg.stream_id = static_cast<int>(dev_idx[seg.dev_id]++ % getPoolSize(seg.dev_id));
+      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
+      const auto& seg = segments_[seg_id];
+      const size_t pool = GetStreamPoolSize(seg.dev_id);
+      std::vector<size_t> load(pool, 0);
+      for (size_t k = 0; k < segments_.size(); ++k) {
+        if (static_cast<int>(k) == seg_id || out[k] < 0) continue;
+        if (segments_[k].dev_id != seg.dev_id) continue;
+        const bool conflict = by_interval
+            ? SegmentsOverlap(static_cast<int>(k), seg_id)
+            : (segments_[k].dependency_level == seg.dependency_level);
+        if (!conflict) continue;
+        if (static_cast<size_t>(out[k]) < pool) ++load[static_cast<size_t>(out[k])];
       }
+      // Lowest-index minimum. At partition 0 the conflict set is exactly the segments
+      // already placed at this level, so this reproduces the rotating per-level counter
+      // stock round-robin used, slot for slot.
+      size_t best = 0;
+      for (size_t s = 1; s < pool; ++s) {
+        if (load[s] < load[best]) best = s;
+      }
+      out[seg_id] = static_cast<int>(best);
+    }
+  }
+}
+
+// ================================================================================================
+void GraphExecSegmented::RoundRobinStreamAssignment() {
+  std::vector<int> assignment;
+  ComputeRoundRobinAssignment(assignment);
+  // Only entries a level actually covered are applied, preserving the previous behaviour of
+  // leaving an unlevelled segment's stream_id untouched.
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    if (assignment[i] >= 0) segments_[i].stream_id = assignment[i];
+  }
+
+  ComputeCompletionSignalFlags();
+}
+
+// ================================================================================================
+// Chain-following assignment (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=4).
+//
+// The placement frame above is kept and only the choice within it changes: the slot is always
+// one of minimal conflict load, so the multiset of per-slot loads is exactly round-robin's and
+// only the labels are permuted -- concurrency structure, and with it stream and ring skew, is
+// unchanged. Within that freedom each segment prefers the slot of the dependency it waits
+// longest for, the edge that would otherwise fall on the critical path. Segments choose in
+// descending critical-path order, so a preference is refused only in favour of a longer chain.
+void GraphExecSegmented::ChainAffinityStreamAssignment() {
+  std::vector<size_t> seg_work;
+  std::vector<size_t> cp;
+  ComputeSegmentWorkAndCriticalPath(seg_work, cp);
+
+  for (auto& seg : segments_) {
+    seg.stream_id = -1;
+  }
+  const bool by_interval = (DEBUG_HIP_GRAPH_SEGMENT_PARTITION != 0);
+
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto it = segments_per_level_.find(level);
+    if (it == segments_per_level_.end()) continue;
+
+    std::vector<int> order;
+    order.reserve(it->second.size());
+    for (int seg_id : it->second) {
+      if (seg_id >= 0 && seg_id < static_cast<int>(segments_.size())) order.push_back(seg_id);
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&cp](int a, int b) { return cp[a] > cp[b]; });
+
+    for (int seg_id : order) {
+      auto& seg = segments_[seg_id];
+      const size_t pool = GetStreamPoolSize(seg.dev_id);
+      std::vector<size_t> load(pool, 0);
+      for (size_t k = 0; k < segments_.size(); ++k) {
+        if (static_cast<int>(k) == seg_id || segments_[k].stream_id < 0) continue;
+        if (segments_[k].dev_id != seg.dev_id) continue;
+        const bool conflict = by_interval
+            ? SegmentsOverlap(static_cast<int>(k), seg_id)
+            : (segments_[k].dependency_level == seg.dependency_level);
+        if (!conflict) continue;
+        if (static_cast<size_t>(segments_[k].stream_id) < pool) {
+          ++load[static_cast<size_t>(segments_[k].stream_id)];
+        }
+      }
+
+      // The producer this segment waits longest for. Dependencies sit at strictly lower
+      // dependency levels and are therefore already assigned; anything unassigned, or on
+      // another device, is skipped rather than guessed.
+      int want = -1;
+      size_t want_cp = 0;
+      for (int dep_id : seg.segment_ids_dependencies) {
+        if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
+        const auto& dep = segments_[dep_id];
+        if (dep.dev_id != seg.dev_id || dep.stream_id < 0) continue;
+        if (want < 0 || cp[dep_id] > want_cp) {
+          want = dep.stream_id;
+          want_cp = cp[dep_id];
+        }
+      }
+
+      size_t min_load = load[0];
+      for (size_t s = 1; s < pool; ++s) min_load = std::min(min_load, load[s]);
+
+      size_t chosen = 0;
+      if (want >= 0 && static_cast<size_t>(want) < pool && load[want] == min_load) {
+        chosen = static_cast<size_t>(want);
+      } else {
+        for (size_t s = 0; s < pool; ++s) {
+          if (load[s] == min_load) { chosen = s; break; }
+        }
+      }
+      seg.stream_id = static_cast<int>(chosen);
     }
   }
 
@@ -1310,29 +2037,130 @@ void GraphExecSegmented::RoundRobinStreamAssignment() {
 }
 
 // ================================================================================================
+// One line per instantiate naming the strategy that actually ran and what it did.
+// Sole printer: an arm is verified from this line, never from the env var having been set.
+//   moved_vs_rr  segments whose stream differs from round-robin's. 0 by construction for the
+//                round-robin modes; a 0 on a heuristic mode means it never disagreed and the
+//                arm cannot show an effect.
+//   invalid      segments left outside [0, pool). Non-zero is a bug, not a configuration:
+//                resolveSegmentStream's `stream_id % streams.size()` turns both -1 and an
+//                over-range id into a valid-looking index, so nothing downstream can fail.
+void GraphExecSegmented::LogStreamAssignment(uint32_t requested, const char* effective) const {
+  std::vector<int> rr;
+  ComputeRoundRobinAssignment(rr);
+
+  int moved_vs_rr = 0;
+  int invalid = 0;
+  std::map<int, std::vector<int>> per_stream;  // dev_id -> segment count per slot
+
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    const auto& seg = segments_[i];
+    const size_t pool = GetStreamPoolSize(seg.dev_id);
+    auto& counts = per_stream[seg.dev_id];
+    if (counts.size() < pool) counts.resize(pool, 0);
+
+    if (seg.stream_id < 0 || static_cast<size_t>(seg.stream_id) >= pool) {
+      ++invalid;
+    } else {
+      ++counts[seg.stream_id];
+    }
+    if (rr[i] >= 0 && rr[i] != seg.stream_id) ++moved_vs_rr;
+  }
+
+  // The property the shared placement frame is supposed to buy: the multiset of per-slot
+  // loads within each conflict set equals round-robin's -- same concurrency structure, labels
+  // permuted. Reported per instantiate because it is the safety argument, and it can fail.
+  int perm_mismatch_levels = 0;
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto lit = segments_per_level_.find(level);
+    if (lit == segments_per_level_.end()) continue;
+    std::map<int, std::vector<int>> got, want;
+    for (int seg_id : lit->second) {
+      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
+      const auto& seg = segments_[seg_id];
+      const size_t pool = GetStreamPoolSize(seg.dev_id);
+      auto& g = got[seg.dev_id];
+      auto& w = want[seg.dev_id];
+      if (g.size() < pool) g.resize(pool, 0);
+      if (w.size() < pool) w.resize(pool, 0);
+      if (seg.stream_id >= 0 && static_cast<size_t>(seg.stream_id) < pool) ++g[seg.stream_id];
+      if (rr[seg_id] >= 0 && static_cast<size_t>(rr[seg_id]) < pool) ++w[rr[seg_id]];
+    }
+    for (auto& [dev_id, g] : got) {
+      auto& w = want[dev_id];
+      std::sort(g.begin(), g.end());
+      std::sort(w.begin(), w.end());
+      if (g != w) { ++perm_mismatch_levels; break; }
+    }
+  }
+
+  std::string detail;
+  for (const auto& [dev_id, counts] : per_stream) {
+    detail += " dev" + std::to_string(dev_id) + ":pool=" + std::to_string(counts.size()) +
+              " per_stream=[";
+    for (size_t s = 0; s < counts.size(); ++s) {
+      if (s) detail += ",";
+      detail += std::to_string(counts[s]);
+    }
+    detail += "]";
+  }
+
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "[hipGraph] StreamAssignment: requested=%u effective=%s partition=%u segs=%zu "
+          "max_level=%d%s moved_vs_rr=%d invalid=%d perm_mismatch_levels=%d",
+          requested, effective, static_cast<uint32_t>(DEBUG_HIP_GRAPH_SEGMENT_PARTITION),
+          segments_.size(), max_dependency_level_, detail.c_str(), moved_vs_rr, invalid,
+          perm_mismatch_levels);
+
+  if (invalid != 0) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] StreamAssignment: %d segment(s) outside [0,pool) after strategy '%s' -- "
+            "these alias onto an arbitrary stream instead of failing",
+            invalid, effective);
+  }
+}
+
+// ================================================================================================
+// ⛔ "Does this segment need a completion signal" is the wrong question once a segment may
+// contain several nodes with cross-stream consumers: the answer is a COUNT, not a flag, and
+// it is a property of NODES. The count matters because ShouldCollapseToSingleStream feeds it
+// into signal_est, which is a DECISION input, not a log line -- a per-segment answer
+// undercounts a merged graph's sync cost and biases the collapse verdict.
+// needs_completion_signal is kept as `count > 0` for the existing readers.
 void GraphExecSegmented::ComputeCompletionSignalFlags() {
   const bool leaf_sync_required = IsLeafNodeSyncRequired();
   for (auto& seg : segments_) {
     seg.needs_completion_signal = false;
+    seg.producer_node_count = 0;
+
     if (seg.segment_ids_edges.empty()) {
       // Leaf segments need a completion signal so EnqueueSegmentedGraph can
       // sync them back to the launch stream via graph_accumulate dep_signals.
       if (leaf_sync_required) {
         seg.needs_completion_signal = true;
+        seg.producer_node_count = 1;
       }
       continue;
     }
-    for (int edge_id : seg.segment_ids_edges) {
-      if (edge_id >= 0 && edge_id < static_cast<int>(segments_.size())) {
-        const auto& edge_seg = segments_[edge_id];
-        // Signal needed if downstream segment is on a different stream OR a
-        // different device — both cases require explicit HW synchronization.
-        if (edge_seg.dev_id != seg.dev_id || edge_seg.stream_id != seg.stream_id) {
-          seg.needs_completion_signal = true;
+
+    // Distinct nodes of this segment that some node on another (device, stream) depends on.
+    std::unordered_set<Node> producers;
+    for (Node n : seg.nodes) {
+      if (n == nullptr) continue;
+      for (Node succ : n->GetEdges()) {
+        auto it = node_to_segment_id_.find(succ);
+        if (it == node_to_segment_id_.end()) continue;
+        const int c = it->second;
+        if (c < 0 || c >= static_cast<int>(segments_.size()) || c == seg.id) continue;
+        const auto& cons = segments_[c];
+        if (cons.dev_id != seg.dev_id || cons.stream_id != seg.stream_id) {
+          producers.insert(n);
           break;
         }
       }
     }
+    seg.producer_node_count = static_cast<int>(producers.size());
+    seg.needs_completion_signal = !producers.empty();
   }
 }
 
@@ -1343,16 +2171,9 @@ void GraphExecSegmented::ComputeCompletionSignalFlags() {
 //   - sid rotates at leaf segments (end of branch), not at forks
 //   - DFS is started from every unscheduled segment (not just dependency-free
 //     roots), with sid incrementing once per outer-loop iteration
-//   - stream pool size is derived from graph parallelism, not DEBUG_HIP_FORCE_GRAPH_QUEUES
+// The pool is max_streams_dev_, the same source every other strategy uses; Init() has
+// already capped it against DEBUG_HIP_FORCE_GRAPH_QUEUES.
 void GraphExecSegmented::DFSStreamAssignment() {
-  // Use actual graph parallelism (max concurrent segments at any level) as the
-  // pool size — avoids allocating more streams than the graph can use in parallel,
-  // which would add unnecessary cross-stream barrier/signal overhead.
-  auto getPoolSize = [&](int dev_id) -> int {
-    auto it = max_streams_dev_.find(dev_id);
-    return (it != max_streams_dev_.end() && it->second > 0) ? it->second : 1;
-  };
-
   // Reset all stream IDs
   for (auto& seg : segments_) {
     seg.stream_id = -1;
@@ -1366,7 +2187,7 @@ void GraphExecSegmented::DFSStreamAssignment() {
     if (segments_[i].stream_id != -1) continue;
 
     // Determine pool size for this entry's device
-    int pool = getPoolSize(segments_[i].dev_id);
+    int pool = static_cast<int>(GetStreamPoolSize(segments_[i].dev_id));
 
     // Stack carries segment ids — sid is shared across the entire DFS from this
     // entry point, exactly like ScheduleOneNode's single `sid` variable.
@@ -1413,38 +2234,38 @@ void GraphExecSegmented::DFSStreamAssignment() {
 //   0 = Collapse (with existing ROI check + max_level<=4 guard) then round-robin
 //   1 = Round-robin only, no collapse
 //   2 = DFS only, no collapse
+//   4 = Chain affinity: round-robin's placement frame, critical-predecessor preference
 void GraphExecSegmented::SelectStreamAssignment() {
-  if (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING == 1) {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: round-robin, no collapse (%zu segs)",
-            segments_.size());
+  const uint32_t requested = DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING;
+  const char* effective = nullptr;
+
+  if (requested == 1) {
+    effective = "roundrobin";
     RoundRobinStreamAssignment();
-    return;
-  }
-  if (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING == 2) {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: DFS, no collapse (%zu segs)", segments_.size());
+  } else if (requested == 2) {
+    effective = "dfs";
     DFSStreamAssignment();
-    return;
+  } else if (requested == 4) {
+    effective = "chain";
+    ChainAffinityStreamAssignment();
+  } else {
+    // 0 = collapse-eligible (ROI heuristic + max_level<=4) then round-robin.
+    // ShouldCollapseToSingleStream() is called later in BuildSyncPlan; the extra
+    // max_level guard there prevents collapse on deep graphs where multi-stream
+    // overlap is genuinely valuable.
+    if (requested != 0) {
+      static std::once_flag once;
+      std::call_once(once, [requested]() {
+        ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+                "[hipGraph] DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=%u is not a mode; behaving as 0",
+                requested);
+      });
+    }
+    effective = (max_dependency_level_ > 4) ? "hybrid-rr" : "hybrid-collapse-eligible";
+    RoundRobinStreamAssignment();
   }
 
-  // 0 = collapse-eligible (ROI heuristic + max_level<=4) then round-robin.
-  // ShouldCollapseToSingleStream() is called later in BuildSyncPlan; the extra
-  // max_level guard here prevents collapse on deep graphs where multi-stream
-  // overlap is genuinely valuable.
-  const bool deep_graph = max_dependency_level_ > 4;
-  if (deep_graph) {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: deep graph (max_level=%d>4), skip collapse -> "
-            "round-robin (%zu segs)",
-            max_dependency_level_, segments_.size());
-  } else {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: collapse-eligible (max_level=%d) -> round-robin "
-            "(%zu segs)",
-            max_dependency_level_, segments_.size());
-  }
-  RoundRobinStreamAssignment();
+  LogStreamAssignment(requested, effective);
 }
 
 // ================================================================================================
@@ -1495,17 +2316,22 @@ void GraphExecSegmented::SelectStreamAssignment() {
 // stream removes both barriers and signals (it runs inline, 0/0), so the full
 // sync cost is what multi-stream genuinely pays over collapse. Tunable via
 // DEBUG_HIP_GRAPH_MIN_OVERLAP; 0 disables the gate.
-bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
-  const uint32_t min_overlap = DEBUG_HIP_GRAPH_MIN_OVERLAP;
-  if (min_overlap == 0) return false;            // gate disabled
-  if (segments_.size() < 2) return false;        // nothing to parallelize
-
-  const int dev0 = segments_.front().dev_id;
-  for (const auto& seg : segments_) {
-    if (seg.dev_id != dev0) return false;
-  }
+// ================================================================================================
+// Structural work per segment, and the critical-path work ending at each segment.
+//
+// Both are pure functions of the segment DAG and node launch geometry: no device timing and --
+// load bearing -- no read of stream_id, so this is valid before stream assignment as well as
+// after. Work is in machine-occupancy passes: a kernel that fills the GPU once weighs 1, one
+// needing N passes weighs N, and every non-kernel or sub-machine launch weighs 1.
+// Unconditional: callers that gate on their own preconditions apply them themselves.
+void GraphExecSegmented::ComputeSegmentWorkAndCriticalPath(std::vector<size_t>& work,
+                                                           std::vector<size_t>& cp) const {
+  work.assign(segments_.size(), 0);
+  cp.assign(segments_.size(), 0);
+  if (segments_.empty()) return;
 
   size_t machine_threads = 0;
+  const int dev0 = segments_.front().dev_id;
   if (dev0 >= 0) {
     const auto& dinfo = g_devices[dev0]->devices()[0]->info();
     machine_threads = static_cast<size_t>(dinfo.maxComputeUnits_) * dinfo.maxThreadsPerCU_;
@@ -1517,10 +2343,41 @@ bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
     return std::max<size_t>(1, (threads + machine_threads - 1) / machine_threads);
   };
 
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    for (Node n : segments_[i].nodes) work[i] += node_work(n);
+  }
+
+  // Level order guarantees every dependency is final before it is read.
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto it = segments_per_level_.find(level);
+    if (it == segments_per_level_.end()) continue;
+    for (int seg_id : it->second) {
+      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
+      size_t best_dep = 0;
+      for (int dep_id : segments_[seg_id].segment_ids_dependencies) {
+        if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
+        best_dep = std::max(best_dep, cp[dep_id]);
+      }
+      cp[seg_id] = best_dep + work[seg_id];
+    }
+  }
+}
+
+// ================================================================================================
+bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
+  const uint32_t min_overlap = DEBUG_HIP_GRAPH_MIN_OVERLAP;
+  if (min_overlap == 0) return false;            // gate disabled
+  if (segments_.size() < 2) return false;        // nothing to parallelize
+
+  const int dev0 = segments_.front().dev_id;
+  for (const auto& seg : segments_) {
+    if (seg.dev_id != dev0) return false;
+  }
+
+  // The sync-cost half DOES read stream_id, so unlike the work terms it is only meaningful
+  // once SelectStreamAssignment has run -- which it has: this is called from BuildSyncPlan.
   size_t barrier_est = 0;
   size_t signal_est = 0;
-  size_t total_work = 0;
-  std::vector<size_t> seg_work(segments_.size(), 0);
   for (size_t i = 0; i < segments_.size(); ++i) {
     const auto& seg = segments_[i];
     size_t cross_deps = 0;
@@ -1534,31 +2391,23 @@ bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
     if (cross_deps >= 2) {
       barrier_est += (cross_deps + 4) / 5;
     }
-    if (seg.needs_completion_signal) {
-      ++signal_est;
-    }
-    for (Node n : seg.nodes) seg_work[i] += node_work(n);
-    total_work += seg_work[i];
+    // One signal per PRODUCING NODE, not per segment: a merged segment can carry several.
+    signal_est += static_cast<size_t>(std::max(0, seg.producer_node_count));
   }
   const size_t sync_cost = barrier_est + signal_est;
   if (sync_cost == 0) return false;
 
-  std::vector<size_t> cp(segments_.size(), 0);
+  // total_work is a sum over ALL segments and still is. critical_path_work was a max over
+  // level-visited segments only; it is now a max over all, and unvisited entries are 0, so
+  // the max is unchanged.
+  std::vector<size_t> seg_work;
+  std::vector<size_t> cp;
+  ComputeSegmentWorkAndCriticalPath(seg_work, cp);
+  size_t total_work = 0;
   size_t critical_path_work = 0;
-  for (int level = 0; level <= max_dependency_level_; ++level) {
-    auto it = segments_per_level_.find(level);
-    if (it == segments_per_level_.end()) continue;
-    for (int seg_id : it->second) {
-      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
-      const auto& seg = segments_[seg_id];
-      size_t best_dep = 0;
-      for (int dep_id : seg.segment_ids_dependencies) {
-        if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
-        best_dep = std::max(best_dep, cp[dep_id]);
-      }
-      cp[seg_id] = best_dep + seg_work[seg_id];
-      critical_path_work = std::max(critical_path_work, cp[seg_id]);
-    }
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    total_work += seg_work[i];
+    critical_path_work = std::max(critical_path_work, cp[i]);
   }
 
   const size_t parallel_slack =
@@ -1902,6 +2751,16 @@ void GraphExecSegmented::PacketBatch::rebuildFilteredLists(
   // the segment never emits its signal and any consumer waiting on it deadlocks.
   std::unordered_set<const void*> disabledBatchPackets;
 
+  // Packets in this batch that already carry a completion signal, so a relocation cannot
+  // land on top of one. Seeded from the patch list rather than assumed empty: with interior
+  // producers an ordinary dispatch packet can be a completion-signal carrier.
+  std::unordered_set<const uint8_t*> claimedForCompletion;
+  for (const auto& patch : patch_list) {
+    if (patch.dep_slot == amd::Device::HwEventPatch::kCompletionSignal) {
+      claimedForCompletion.insert(patch.packet);
+    }
+  }
+
   for (size_t i = 0; i < dispatchPackets.size(); ++i) {
     if (packetEnabled[i]) {
       size_t filteredIdx = enabledPackets.size();
@@ -1949,10 +2808,20 @@ void GraphExecSegmented::PacketBatch::rebuildFilteredLists(
       continue;
     }
 
-    if (!enabledPackets.empty()) {
-      // Relocate the signal to the last still-enabled packet of this batch.
-      const size_t last_idx = enabledPackets.size() - 1;
-      patch.flat_packet = filteredFlatPacketData.data() + last_idx * kAqlPktSize;
+    // Relocate the signal to the last still-enabled packet of this batch that is not
+    // ALREADY carrying a completion signal. Interior producers put completion signals on
+    // ordinary dispatch packets, so the naive "last enabled packet" can already be spoken
+    // for, and writing a second signal there would silently drop the first.
+    size_t relocate_idx = enabledPackets.size();
+    for (size_t k = enabledPackets.size(); k-- > 0;) {
+      if (claimedForCompletion.find(enabledPackets[k]) == claimedForCompletion.end()) {
+        relocate_idx = k;
+        break;
+      }
+    }
+    if (relocate_idx < enabledPackets.size()) {
+      patch.flat_packet = filteredFlatPacketData.data() + relocate_idx * kAqlPktSize;
+      claimedForCompletion.insert(enabledPackets[relocate_idx]);
     } else if (fallbackBarrier != nullptr) {
       // Every node packet in this batch is disabled: no packet remains to host
       // the signal. Splice the reserved standalone barrier into the *filtered*
@@ -1968,6 +2837,13 @@ void GraphExecSegmented::PacketBatch::rebuildFilteredLists(
       }
       patch.flat_packet =
           filteredFlatPacketData.data() + fallback_idx * kAqlPktSize;
+      claimedForCompletion.insert(fallbackBarrier);
+    } else {
+      // No carrier left at all. Say so: the alternative is a consumer that waits forever
+      // with nothing in the log.
+      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+              "[hipGraph] COMPLETION SIGNAL DROPPED: batch has no packet left to carry it "
+              "after node disable; consumers of this signal will deadlock");
     }
   }
 
@@ -2172,13 +3048,34 @@ hipError_t GraphExecSegmented::CaptureAndFormPacketsForGraph() {
     }
   }
 
-  // Resolve flat_packet pointers for all HwEventPatches
+  // Resolve flat_packet pointers for all HwEventPatches.
+  // ⛔ A MISS used to leave flat_packet at whatever it already held -- nullptr for every
+  // patch -- and ApplyHwEventPatches writes THROUGH it, so the failure surfaces as an
+  // aperture violation at launch rather than at the miss. Count them and drop them, so a
+  // miss loses ordering (detectable) instead of faulting the GPU (not attributable).
+  size_t unresolved = 0;
   for (auto& patch : sync_plan_.patch_list) {
     auto it = pktToFlat.find(patch.packet);
     if (it != pktToFlat.end()) {
       patch.flat_packet = it->second;
+    } else {
+      ++unresolved;
+      patch.flat_packet = nullptr;
     }
   }
+  if (unresolved != 0) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] PATCH UNRESOLVED: %zu of %zu HwEventPatches have no flat packet -- "
+            "dropped rather than written through null; their ordering is LOST",
+            unresolved, sync_plan_.patch_list.size());
+    sync_plan_.patch_list.erase(
+        std::remove_if(sync_plan_.patch_list.begin(), sync_plan_.patch_list.end(),
+                       [](const amd::Device::HwEventPatch& p) { return p.flat_packet == nullptr; }),
+        sync_plan_.patch_list.end());
+  }
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "[hipGraph] PatchResolve: total=%zu unresolved=%zu",
+          sync_plan_.patch_list.size(), unresolved);
 
   return status;
 }
@@ -2640,7 +3537,9 @@ amd::Command* GraphExecSegmented::EnqueueSegmentedGraph(hip::Stream* launch_stre
       if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
       hip::Stream* seg_stream = resolveSegmentStream(segments_[seg_id]);
       if (seg_stream == launch_stream) continue;
-      int hw_slot = sync_plan_.seg_to_hw_event[seg_id];  // PASS 1 guarantees >= 0; guard defensively.
+      // A leaf's TAIL always has a slot (ComputeProducerNodes adds it under
+      // IsLeafNodeSyncRequired); guard defensively.
+      int hw_slot = HwEventSlotFor(segments_[seg_id].last_node);
       if (hw_slot < 0 || hw_slot >= static_cast<int>(segment_hw_events.size())) continue;
       graph_accumulate->addDepHwEvent(segment_hw_events[hw_slot]);
     }
@@ -3329,6 +4228,9 @@ hipError_t GraphExecSegmented::Run(hip::Stream* launch_stream) {
 }
 
 // ================================================================================================
+// Process-wide count of signal sets created OUTSIDE prepopulation, i.e. pool growth.
+static std::atomic<size_t> g_graph_signal_sets_created{0};
+
 GraphSignalManager::~GraphSignalManager() {
   // No launches can be in flight at this point (GraphExecBase refcount guarantees
   // it outlives all launches), so every set is back in the free pool.
@@ -3374,13 +4276,18 @@ bool GraphSignalManager::Prepopulate(amd::Device* device, int count, int num_set
 
   // Top up to num_sets only; do not unconditionally append on every call, which
   // would grow the pool without bound across re-instantiations.
-  for (int i = static_cast<int>(pool.size()); i < num_sets; ++i) {
+  const int before = static_cast<int>(pool.size());
+  for (int i = before; i < num_sets; ++i) {
     std::vector<void*> set;
     if (!device->CreateHwEvents(count, set)) {
       return false;
     }
     pool.push_back(std::move(set));
   }
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "[hipGraph] SignalPool: prepopulated %d -> %zu sets of %d signals "
+          "(ordering_edge=%u, device-resident when non-zero)",
+          before, pool.size(), count, static_cast<uint32_t>(DEBUG_CLR_DEVICE_ORDERING_EDGE));
   return true;
 }
 
@@ -3404,6 +4311,19 @@ bool GraphSignalManager::AcquireSet(amd::Device* device, int count,
 
   // Fallback only: more launches in flight than pre-created sets. Create one
   // (armed to 1 by CreateHwEvents); it joins the pool when released.
+  //
+  // ⚠️ This path is not free and it is not bounded. At DEBUG_CLR_DEVICE_ORDERING_EDGE != 0
+  // each signal carries a DEVICE-RESIDENT value word, so every set created here consumes
+  // DEVICE memory that is never returned until the graph is destroyed -- it reads as
+  // "non-torch memory" to a framework doing a memory profile, not as a leak. Counted and
+  // reported so pool growth is visible instead of being attributed to the model.
+  const size_t grown = ++g_graph_signal_sets_created;
+  if ((grown & (grown - 1)) == 0) {  // powers of two only: O(log n) lines, not O(n)
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[hipGraph] SignalPoolGrowth: %zu extra set(s) created beyond prepopulation "
+            "(%d signals each, ordering_edge=%u)",
+            grown, count, static_cast<uint32_t>(DEBUG_CLR_DEVICE_ORDERING_EDGE));
+  }
   return device->CreateHwEvents(count, out_set);
 }
 

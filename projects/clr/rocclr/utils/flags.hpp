@@ -253,7 +253,23 @@ release(uint, DEBUG_HIP_GRAPH_BATCH_SIZE, 256,                                \
         "Number of graph nodes to batch at a time")                           \
 release(uint, DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING, 0,                          \
         "Segment scheduling mode (segmented path only): "                      \
-        "0=Hybrid/auto, 1=Round-robin, 2=DFS")                                \
+        "0=Hybrid/auto, 1=Round-robin, 2=DFS, 4=Chain affinity")               \
+release(uint, DEBUG_HIP_GRAPH_SEGMENT_PARTITION, 0,                           \
+        "Segment partitioning (segmented path only): 0=cut at every fork and "  \
+        "join, 1=merge a fork into edges[0], 2=merge a fork into its heaviest " \
+        "fork/join-free branch")                                               \
+release(uint, DEBUG_CLR_PP_MODE, 2,                                           \
+        "Per-producer (node-granular) segment sync: 0=off, consumers wait on "  \
+        "the producer segment's tail; 1=emit interior completion signals but "  \
+        "still wait on the tail; 2=emit and redirect each consumer to the node " \
+        "it depends on; 3=as 2 with cross-stream barrier de-duplication "       \
+        "disabled (diagnostic, strictly more barriers); 4=as 2 but with the "   \
+        "old SEGMENT-granular de-duplication, which is UNSOUND with interior "  \
+        "producers (diagnostic only, reproduces the fault on demand)")          \
+release(uint, DEBUG_HIP_GRAPH_SYNC_AUDIT, 0,                                  \
+        "1 = at instantiate, re-derive the ordering each cross-segment graph "  \
+        "edge actually receives from the sync plan and report any edge left "   \
+        "uncovered")                                                            \
 release(uint, DEBUG_HIP_GRAPH_MIN_OVERLAP, 2,                                 \
         "Min overlappable work (in occupancy passes) per unit of cross-stream "\
         "sync (barrier packets + completion signals) to keep a graph "         \

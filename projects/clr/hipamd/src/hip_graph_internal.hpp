@@ -7,7 +7,13 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <map>
+#include <mutex>
 #include <queue>
+#include <set>
+#include <string>
+#include <utility>
 #include <stack>
 #include <iostream>
 #include <unordered_map>
@@ -799,6 +805,23 @@ class Graph {
   //! Resolve dependencies between segments
   void ResolveSegmentDependencies();
 
+  //! Longest-path level of every NODE, and the resulting [first, last] node-level interval
+  //! each segment is live over. Segment dependency levels count segment hops and cannot be
+  //! compared with these; everything that reasons about concurrency uses node levels only.
+  void ComputeNodeLevels();
+  //! True when the two segments' node-level intervals intersect, i.e. they can be executing
+  //! at the same time and therefore want different streams.
+  bool SegmentsOverlap(int a, int b) const;
+  //! Peak number of segments simultaneously live on |dev_id| in node-level terms. This is
+  //! the concurrency the stream pool has to cover; the per-level segment count is only a
+  //! lower bound on it, and merging makes the gap large.
+  int PeakLiveSegments(int dev_id) const;
+
+  //! Node level (longest path from a root). Empty until ComputeNodeLevels().
+  std::unordered_map<Node, int> node_level_;
+  //! [segment id] -> {first node level live, last node level live}.
+  std::vector<std::pair<int, int>> segment_live_;
+
   //! Calculate dependency levels for segments using topological sort
   void CalculateSegmentTopoDependencyLevels();
 
@@ -964,7 +987,11 @@ class Graph {
     // Hierarchical child graph information
     Graph* child_graph_ptr = nullptr;           // Direct pointer to child graph for quick access
 
-    bool needs_completion_signal = false;        // True if any downstream segment is on a different stream/device, or this is a leaf
+    bool needs_completion_signal = false;        // True if producer_node_count > 0
+    // Distinct NODES of this segment whose completion some other stream/device observes.
+    // A fork/join-free segment has 0 or 1; a merged segment can have more, and the collapse
+    // heuristic's sync-cost estimate has to see the real number.
+    int producer_node_count = 0;
   };
 
   //! Segment information for batch scheduling
@@ -1180,6 +1207,50 @@ class GraphExecSegmented : public GraphExecBase {
   void RoundRobinStreamAssignment();
   //! DFS stream assignment: preserves chain continuity across segment DAG branches
   void DFSStreamAssignment();
+  //! Chain-following assignment: within round-robin's load frame, each segment prefers the
+  //! stream of the dependency it waits longest for.
+  void ChainAffinityStreamAssignment();
+  //! Stream-slot count for a device, after Init()'s DEBUG_HIP_FORCE_GRAPH_QUEUES cap.
+  //! Single definition so every assignment strategy sizes its pool identically.
+  size_t GetStreamPoolSize(int dev_id) const;
+  //! Round-robin assignment computed into |out| without touching segments_, so another
+  //! strategy can be diffed against it. Segments no level covered stay -1.
+  void ComputeRoundRobinAssignment(std::vector<int>& out) const;
+  //! Per-segment structural work, and critical-path work ending at each segment. Reads no
+  //! stream_id, so it is valid before stream assignment as well as after.
+  void ComputeSegmentWorkAndCriticalPath(std::vector<size_t>& work,
+                                         std::vector<size_t>& cp) const;
+  //! The single per-instantiate line naming the effective strategy and its outcome.
+  void LogStreamAssignment(uint32_t requested, const char* effective) const;
+
+  //! HW-event slot for a producing node, or -1 when nothing observes its completion.
+  int HwEventSlotFor(Node n) const;
+  //! Index of |n| within its own segment, or -1. A segment is one in-order stream, so
+  //! waiting on the node at index k orders the consumer after every index <= k.
+  int NodePos(Node n) const;
+  //! Which node of each producer segment a consumer must actually wait on, and which nodes
+  //! therefore need a completion slot. Populated before PASS 1 of BuildSyncPlan.
+  void ComputeProducerNodes();
+  //! The node of |producer_seg| that |consumer_seg| must wait on. Falls back to the
+  //! producer segment's tail, which is never less synchronisation than before.
+  Node ProducerFor(int consumer_seg, int producer_seg) const;
+  //! Last captured packet of |n| within its segment batch, or nullptr when |n| cannot
+  //! carry a signal of its own (uncaptured, no range, or a zero-packet range).
+  uint8_t* LastPacketOfNode(int segment_id, Node n) const;
+  //! Re-derive, from the materialised sync plan alone, the ordering every cross-segment
+  //! graph edge actually receives, and report the ones left uncovered. Returns the number
+  //! of uncovered edges. Independent of the code that built the plan.
+  size_t AuditSyncPlan() const;
+
+  //! [consumer segment id][producer segment id] -> the node of the producer to wait on.
+  std::vector<std::unordered_map<int, Node>> dep_producer_;
+  //! [segment id] -> nodes of that segment needing a completion slot, in node order.
+  std::vector<std::vector<Node>> segment_producer_nodes_;
+  //! node -> index within its segment. Built by ComputeProducerNodes.
+  std::unordered_map<Node, int> node_pos_;
+  //! [segment id] -> the cross-stream waits actually emitted: (producer segment, node).
+  std::vector<std::vector<std::pair<int, Node>>> effective_barrier_deps_;
+
   //! Select stream assignment algorithm based on graph complexity
   void SelectStreamAssignment();
   //! Recompute each segment's needs_completion_signal flag from its current
@@ -1294,10 +1365,17 @@ class GraphExecSegmented : public GraphExecBase {
     int num_segments = 0;   // total segment count (used for bounds checks)
     int num_hw_events = 0;  // HW event slots to allocate (one per ncs=true segment)
 
-    // Dense index into segment_hw_events for each segment.
-    // seg_to_hw_event[seg_id] == -1  ->  no completion signal emitted.
-    // seg_to_hw_event[seg_id] >= 0  ->  index into the compact hw_events vector.
-    std::vector<int> seg_to_hw_event;
+    // Index into segment_hw_events for each PRODUCING NODE.
+    //   absent        -> that node emits no completion signal.
+    //   present >= 0  -> index into the compact hw_events vector.
+    //
+    // Keyed by node rather than by segment because a segment may contain more than one
+    // producing node once partitioning is allowed to merge a fork into a branch. With
+    // fork/join path decomposition the only producer of a segment is its last_node, so
+    // this degenerates to the previous per-segment mapping exactly.
+    // A map, not a GetID()-indexed vector: GraphNode::nextID is a process-global atomic,
+    // so ids are globally monotonic and not dense within one graph.
+    std::unordered_map<Node, int> node_to_hw_event;
 
     std::vector<amd::Device::HwEventPatch> patch_list;
     std::vector<uint8_t*> barrier_packets;
