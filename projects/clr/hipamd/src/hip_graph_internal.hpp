@@ -1180,6 +1180,23 @@ class GraphExecSegmented : public GraphExecBase {
   void RoundRobinStreamAssignment();
   //! DFS stream assignment: preserves chain continuity across segment DAG branches
   void DFSStreamAssignment();
+  //! Chain-following assignment: within round-robin's level frame, each segment prefers
+  //! the stream of the dependency it waits longest for. Same per-level load multiset.
+  void ChainAffinityStreamAssignment();
+  //! Stream-slot count for a device, after Init()'s DEBUG_HIP_FORCE_GRAPH_QUEUES cap.
+  //! Single definition so every assignment strategy sizes its pool identically.
+  size_t GetStreamPoolSize(int dev_id) const;
+  //! Round-robin assignment computed into `out` without touching segments_, so a
+  //! strategy can be compared against it. Segments absent from segments_per_level_
+  //! are left at -1 and must not be applied.
+  void ComputeRoundRobinAssignment(std::vector<int>& out) const;
+  //! Per-segment structural work, and critical-path work ending at each segment.
+  //! Reads no stream_id, so it is valid before stream assignment as well as after.
+  void ComputeSegmentWorkAndCriticalPath(std::vector<size_t>& work,
+                                         std::vector<size_t>& cp) const;
+  //! The single per-instantiate line naming the effective strategy and its outcome.
+  //! Sole printer for it: a field added here must not be duplicated elsewhere.
+  void LogStreamAssignment(uint32_t requested, const char* effective) const;
   //! Select stream assignment algorithm based on graph complexity
   void SelectStreamAssignment();
   //! Recompute each segment's needs_completion_signal flag from its current

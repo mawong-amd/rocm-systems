@@ -1280,15 +1280,18 @@ hipError_t GraphExecSegmented::FindStreamsReqPerDevForSegments() {
 }
 
 // ================================================================================================
-void GraphExecSegmented::RoundRobinStreamAssignment() {
-  // max_streams_dev_ represents the total stream-slot count uniformly per device;
-  // CreateStreams() does not adjust it. The capture device's slot 0 instead comes
-  // from the launch stream (same-device) or EnsureCrossDeviceStream() (cross-device).
-  auto getPoolSize = [&](int dev_id) -> size_t {
-    auto it = max_streams_dev_.find(dev_id);
-    return (it != max_streams_dev_.end() && it->second > 0)
-               ? static_cast<size_t>(it->second) : 1;
-  };
+// max_streams_dev_ represents the total stream-slot count uniformly per device;
+// CreateStreams() does not adjust it. The capture device's slot 0 instead comes
+// from the launch stream (same-device) or EnsureCrossDeviceStream() (cross-device).
+// Init() caps this against DEBUG_HIP_FORCE_GRAPH_QUEUES before assignment runs.
+size_t GraphExecSegmented::GetStreamPoolSize(int dev_id) const {
+  auto it = max_streams_dev_.find(dev_id);
+  return (it != max_streams_dev_.end() && it->second > 0) ? static_cast<size_t>(it->second) : 1;
+}
+
+// ================================================================================================
+void GraphExecSegmented::ComputeRoundRobinAssignment(std::vector<int>& out) const {
+  out.assign(segments_.size(), -1);
 
   for (int level = 0; level <= max_dependency_level_; ++level) {
     auto it = segments_per_level_.find(level);
@@ -1300,10 +1303,21 @@ void GraphExecSegmented::RoundRobinStreamAssignment() {
 
     for (int seg_id : it->second) {
       if (seg_id >= 0 && seg_id < static_cast<int>(segments_.size())) {
-        auto& seg = segments_[seg_id];
-        seg.stream_id = static_cast<int>(dev_idx[seg.dev_id]++ % getPoolSize(seg.dev_id));
+        const auto& seg = segments_[seg_id];
+        out[seg_id] = static_cast<int>(dev_idx[seg.dev_id]++ % GetStreamPoolSize(seg.dev_id));
       }
     }
+  }
+}
+
+// ================================================================================================
+void GraphExecSegmented::RoundRobinStreamAssignment() {
+  std::vector<int> assignment;
+  ComputeRoundRobinAssignment(assignment);
+  // Only entries a level actually covered are applied, preserving the previous
+  // behaviour of leaving an unlevelled segment's stream_id untouched.
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    if (assignment[i] >= 0) segments_[i].stream_id = assignment[i];
   }
 
   ComputeCompletionSignalFlags();
@@ -1343,16 +1357,9 @@ void GraphExecSegmented::ComputeCompletionSignalFlags() {
 //   - sid rotates at leaf segments (end of branch), not at forks
 //   - DFS is started from every unscheduled segment (not just dependency-free
 //     roots), with sid incrementing once per outer-loop iteration
-//   - stream pool size is derived from graph parallelism, not DEBUG_HIP_FORCE_GRAPH_QUEUES
+// The pool is max_streams_dev_, the same source every other strategy uses; it is
+// already capped against DEBUG_HIP_FORCE_GRAPH_QUEUES by Init().
 void GraphExecSegmented::DFSStreamAssignment() {
-  // Use actual graph parallelism (max concurrent segments at any level) as the
-  // pool size — avoids allocating more streams than the graph can use in parallel,
-  // which would add unnecessary cross-stream barrier/signal overhead.
-  auto getPoolSize = [&](int dev_id) -> int {
-    auto it = max_streams_dev_.find(dev_id);
-    return (it != max_streams_dev_.end() && it->second > 0) ? it->second : 1;
-  };
-
   // Reset all stream IDs
   for (auto& seg : segments_) {
     seg.stream_id = -1;
@@ -1366,7 +1373,7 @@ void GraphExecSegmented::DFSStreamAssignment() {
     if (segments_[i].stream_id != -1) continue;
 
     // Determine pool size for this entry's device
-    int pool = getPoolSize(segments_[i].dev_id);
+    int pool = static_cast<int>(GetStreamPoolSize(segments_[i].dev_id));
 
     // Stack carries segment ids — sid is shared across the entire DFS from this
     // entry point, exactly like ScheduleOneNode's single `sid` variable.
@@ -1409,42 +1416,199 @@ void GraphExecSegmented::DFSStreamAssignment() {
 }
 
 // ================================================================================================
+// Chain-following assignment (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=4).
+//
+// Round-robin's level frame is kept and only the choice within it changes: the slot is always
+// one of minimal current load at this level, so the per-level multiset of stream loads is
+// exactly round-robin's and only the labels are permuted -- the concurrency structure, and with
+// it the stream and ring skew, is unchanged. Within that freedom each segment prefers the slot
+// of the dependency it waits longest for, which is the edge that would otherwise fall on the
+// critical path. Segments choose in descending critical-path order so a preference is refused
+// only in favour of a longer chain.
+void GraphExecSegmented::ChainAffinityStreamAssignment() {
+  std::vector<size_t> seg_work;
+  std::vector<size_t> cp;
+  ComputeSegmentWorkAndCriticalPath(seg_work, cp);
+
+  for (auto& seg : segments_) {
+    seg.stream_id = -1;
+  }
+
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto it = segments_per_level_.find(level);
+    if (it == segments_per_level_.end()) continue;
+
+    std::vector<int> order;
+    order.reserve(it->second.size());
+    for (int seg_id : it->second) {
+      if (seg_id >= 0 && seg_id < static_cast<int>(segments_.size())) order.push_back(seg_id);
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&cp](int a, int b) { return cp[a] > cp[b]; });
+
+    // Per-device slot occupancy for THIS level only, reset per level exactly as round-robin's
+    // counter is, which is what preserves the per-level multiset.
+    std::unordered_map<int, std::vector<size_t>> load;
+
+    for (int seg_id : order) {
+      auto& seg = segments_[seg_id];
+      const size_t pool = GetStreamPoolSize(seg.dev_id);
+      auto& slots = load[seg.dev_id];
+      if (slots.size() < pool) slots.resize(pool, 0);
+
+      // The producer this segment waits longest for. Dependencies sit at strictly lower levels
+      // and are therefore already assigned; anything not assigned, or on another device, is
+      // skipped rather than guessed.
+      int want = -1;
+      size_t want_cp = 0;
+      for (int dep_id : seg.segment_ids_dependencies) {
+        if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
+        const auto& dep = segments_[dep_id];
+        if (dep.dev_id != seg.dev_id || dep.stream_id < 0) continue;
+        if (want < 0 || cp[dep_id] > want_cp) {
+          want = dep.stream_id;
+          want_cp = cp[dep_id];
+        }
+      }
+
+      size_t min_load = slots[0];
+      for (size_t s = 1; s < pool; ++s) min_load = std::min(min_load, slots[s]);
+
+      size_t chosen = 0;
+      if (want >= 0 && static_cast<size_t>(want) < pool && slots[want] == min_load) {
+        chosen = static_cast<size_t>(want);
+      } else {
+        for (size_t s = 0; s < pool; ++s) {
+          if (slots[s] == min_load) {
+            chosen = s;
+            break;
+          }
+        }
+      }
+      seg.stream_id = static_cast<int>(chosen);
+      ++slots[chosen];
+    }
+  }
+
+  ComputeCompletionSignalFlags();
+}
+
+// ================================================================================================
+// One line per instantiate, naming the strategy that actually ran and what it did.
+// Sole printer: an arm is verified from this line, never from the env var having been set.
+//   moved_vs_rr  segments whose stream differs from what round-robin would assign. 0 by
+//                construction for the round-robin-based modes; on a heuristic mode a 0
+//                means the heuristic never disagreed and the arm cannot show an effect.
+//   invalid      segments left outside [0, pool). Non-zero is a bug, not a configuration:
+//                resolveSegmentStream's `stream_id % streams.size()` turns both -1 and an
+//                over-range id into a valid-looking index, so nothing downstream can fail.
+void GraphExecSegmented::LogStreamAssignment(uint32_t requested, const char* effective) const {
+  std::vector<int> rr;
+  ComputeRoundRobinAssignment(rr);
+
+  int moved_vs_rr = 0;
+  int invalid = 0;
+  std::map<int, std::vector<int>> per_stream;  // dev_id -> segment count per slot
+
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    const auto& seg = segments_[i];
+    const size_t pool = GetStreamPoolSize(seg.dev_id);
+    auto& counts = per_stream[seg.dev_id];
+    if (counts.size() < pool) counts.resize(pool, 0);
+
+    if (seg.stream_id < 0 || static_cast<size_t>(seg.stream_id) >= pool) {
+      ++invalid;
+    } else {
+      ++counts[seg.stream_id];
+    }
+    if (rr[i] >= 0 && rr[i] != seg.stream_id) ++moved_vs_rr;
+  }
+
+  // The property the level frame is supposed to buy: at every level, the multiset of per-slot
+  // segment counts must equal round-robin's -- same concurrency structure, labels permuted.
+  // Reported per instantiate because it is the safety argument, and it can fail: a free DAG
+  // walk (mode 2) does not have it.
+  int perm_mismatch_levels = 0;
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto lit = segments_per_level_.find(level);
+    if (lit == segments_per_level_.end()) continue;
+    std::map<int, std::vector<int>> got, want;
+    for (int seg_id : lit->second) {
+      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
+      const auto& seg = segments_[seg_id];
+      const size_t pool = GetStreamPoolSize(seg.dev_id);
+      auto& g = got[seg.dev_id];
+      auto& w = want[seg.dev_id];
+      if (g.size() < pool) g.resize(pool, 0);
+      if (w.size() < pool) w.resize(pool, 0);
+      if (seg.stream_id >= 0 && static_cast<size_t>(seg.stream_id) < pool) ++g[seg.stream_id];
+      if (rr[seg_id] >= 0 && static_cast<size_t>(rr[seg_id]) < pool) ++w[rr[seg_id]];
+    }
+    for (auto& [dev_id, g] : got) {
+      auto& w = want[dev_id];
+      std::sort(g.begin(), g.end());
+      std::sort(w.begin(), w.end());
+      if (g != w) {
+        ++perm_mismatch_levels;
+        break;
+      }
+    }
+  }
+
+  std::string detail;
+  for (const auto& [dev_id, counts] : per_stream) {
+    detail += " dev" + std::to_string(dev_id) + ":pool=" + std::to_string(counts.size()) +
+              " per_stream=[";
+    for (size_t s = 0; s < counts.size(); ++s) {
+      if (s) detail += ",";
+      detail += std::to_string(counts[s]);
+    }
+    detail += "]";
+  }
+
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "[hipGraph] StreamAssignment: requested=%u effective=%s segs=%zu max_level=%d%s "
+          "moved_vs_rr=%d invalid=%d perm_mismatch_levels=%d",
+          requested, effective, segments_.size(), max_dependency_level_, detail.c_str(),
+          moved_vs_rr, invalid, perm_mismatch_levels);
+
+  if (invalid != 0) {
+    ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
+            "[hipGraph] StreamAssignment: %d segment(s) outside [0,pool) after strategy '%s' -- "
+            "these alias onto an arbitrary stream instead of failing",
+            invalid, effective);
+  }
+}
+
+// ================================================================================================
 // Select stream assignment algorithm (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING):
 //   0 = Collapse (with existing ROI check + max_level<=4 guard) then round-robin
 //   1 = Round-robin only, no collapse
 //   2 = DFS only, no collapse
+//   4 = Chain affinity: round-robin's level frame, critical-predecessor preference
 void GraphExecSegmented::SelectStreamAssignment() {
-  if (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING == 1) {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: round-robin, no collapse (%zu segs)",
-            segments_.size());
+  const uint32_t requested = DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING;
+  const char* effective = nullptr;
+
+  if (requested == 1) {
+    effective = "roundrobin";
     RoundRobinStreamAssignment();
-    return;
-  }
-  if (DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING == 2) {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: DFS, no collapse (%zu segs)", segments_.size());
+  } else if (requested == 2) {
+    effective = "dfs";
     DFSStreamAssignment();
-    return;
+  } else if (requested == 4) {
+    effective = "chain";
+    ChainAffinityStreamAssignment();
+  } else {
+    // 0 = collapse-eligible (ROI heuristic + max_level<=4) then round-robin.
+    // ShouldCollapseToSingleStream() is called later in BuildSyncPlan; the extra
+    // max_level guard here prevents collapse on deep graphs where multi-stream
+    // overlap is genuinely valuable.
+    effective = (max_dependency_level_ > 4) ? "hybrid-rr" : "hybrid-collapse-eligible";
+    RoundRobinStreamAssignment();
   }
 
-  // 0 = collapse-eligible (ROI heuristic + max_level<=4) then round-robin.
-  // ShouldCollapseToSingleStream() is called later in BuildSyncPlan; the extra
-  // max_level guard here prevents collapse on deep graphs where multi-stream
-  // overlap is genuinely valuable.
-  const bool deep_graph = max_dependency_level_ > 4;
-  if (deep_graph) {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: deep graph (max_level=%d>4), skip collapse -> "
-            "round-robin (%zu segs)",
-            max_dependency_level_, segments_.size());
-  } else {
-    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
-            "[hipGraph] SelectStreamAssignment: collapse-eligible (max_level=%d) -> round-robin "
-            "(%zu segs)",
-            max_dependency_level_, segments_.size());
-  }
-  RoundRobinStreamAssignment();
+  LogStreamAssignment(requested, effective);
 }
 
 // ================================================================================================
@@ -1495,17 +1659,22 @@ void GraphExecSegmented::SelectStreamAssignment() {
 // stream removes both barriers and signals (it runs inline, 0/0), so the full
 // sync cost is what multi-stream genuinely pays over collapse. Tunable via
 // DEBUG_HIP_GRAPH_MIN_OVERLAP; 0 disables the gate.
-bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
-  const uint32_t min_overlap = DEBUG_HIP_GRAPH_MIN_OVERLAP;
-  if (min_overlap == 0) return false;            // gate disabled
-  if (segments_.size() < 2) return false;        // nothing to parallelize
-
-  const int dev0 = segments_.front().dev_id;
-  for (const auto& seg : segments_) {
-    if (seg.dev_id != dev0) return false;
-  }
+// ================================================================================================
+// Structural work per segment, and the critical-path work ending at each segment.
+//
+// Both are pure functions of the segment DAG and node launch geometry: no device timing and --
+// load bearing -- no read of stream_id, so this is valid before stream assignment as well as
+// after. Work is in machine-occupancy passes: a kernel that fills the GPU once weighs 1, one
+// needing N passes weighs N, and every non-kernel or sub-machine launch weighs 1.
+// Unconditional: callers that gate on their own preconditions apply them themselves.
+void GraphExecSegmented::ComputeSegmentWorkAndCriticalPath(std::vector<size_t>& work,
+                                                           std::vector<size_t>& cp) const {
+  work.assign(segments_.size(), 0);
+  cp.assign(segments_.size(), 0);
+  if (segments_.empty()) return;
 
   size_t machine_threads = 0;
+  const int dev0 = segments_.front().dev_id;
   if (dev0 >= 0) {
     const auto& dinfo = g_devices[dev0]->devices()[0]->info();
     machine_threads = static_cast<size_t>(dinfo.maxComputeUnits_) * dinfo.maxThreadsPerCU_;
@@ -1517,10 +1686,42 @@ bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
     return std::max<size_t>(1, (threads + machine_threads - 1) / machine_threads);
   };
 
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    for (Node n : segments_[i].nodes) work[i] += node_work(n);
+  }
+
+  // Level order guarantees every dependency is final before it is read.
+  for (int level = 0; level <= max_dependency_level_; ++level) {
+    auto it = segments_per_level_.find(level);
+    if (it == segments_per_level_.end()) continue;
+    for (int seg_id : it->second) {
+      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
+      size_t best_dep = 0;
+      for (int dep_id : segments_[seg_id].segment_ids_dependencies) {
+        if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
+        best_dep = std::max(best_dep, cp[dep_id]);
+      }
+      cp[seg_id] = best_dep + work[seg_id];
+    }
+  }
+}
+
+// ================================================================================================
+bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
+  const uint32_t min_overlap = DEBUG_HIP_GRAPH_MIN_OVERLAP;
+  if (min_overlap == 0) return false;            // gate disabled
+  if (segments_.size() < 2) return false;        // nothing to parallelize
+
+  const int dev0 = segments_.front().dev_id;
+  for (const auto& seg : segments_) {
+    if (seg.dev_id != dev0) return false;
+  }
+
+  // The sync-cost half DOES read stream_id, so unlike the work terms below it is only
+  // meaningful once SelectStreamAssignment has run -- which it has, this is called from
+  // BuildSyncPlan.
   size_t barrier_est = 0;
   size_t signal_est = 0;
-  size_t total_work = 0;
-  std::vector<size_t> seg_work(segments_.size(), 0);
   for (size_t i = 0; i < segments_.size(); ++i) {
     const auto& seg = segments_[i];
     size_t cross_deps = 0;
@@ -1537,28 +1738,18 @@ bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
     if (seg.needs_completion_signal) {
       ++signal_est;
     }
-    for (Node n : seg.nodes) seg_work[i] += node_work(n);
-    total_work += seg_work[i];
   }
   const size_t sync_cost = barrier_est + signal_est;
   if (sync_cost == 0) return false;
 
-  std::vector<size_t> cp(segments_.size(), 0);
+  std::vector<size_t> seg_work;
+  std::vector<size_t> cp;
+  ComputeSegmentWorkAndCriticalPath(seg_work, cp);
+  size_t total_work = 0;
   size_t critical_path_work = 0;
-  for (int level = 0; level <= max_dependency_level_; ++level) {
-    auto it = segments_per_level_.find(level);
-    if (it == segments_per_level_.end()) continue;
-    for (int seg_id : it->second) {
-      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) continue;
-      const auto& seg = segments_[seg_id];
-      size_t best_dep = 0;
-      for (int dep_id : seg.segment_ids_dependencies) {
-        if (dep_id < 0 || dep_id >= static_cast<int>(segments_.size())) continue;
-        best_dep = std::max(best_dep, cp[dep_id]);
-      }
-      cp[seg_id] = best_dep + seg_work[seg_id];
-      critical_path_work = std::max(critical_path_work, cp[seg_id]);
-    }
+  for (size_t i = 0; i < segments_.size(); ++i) {
+    total_work += seg_work[i];
+    critical_path_work = std::max(critical_path_work, cp[i]);
   }
 
   const size_t parallel_slack =
