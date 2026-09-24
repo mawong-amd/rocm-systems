@@ -253,6 +253,13 @@ const char* BlitLinearSourceCode = BLIT_KERNELS(
             break;
         }
       }
+    }
+
+    // Stores a graph ordering edge's value word in place of a CP completion signal. The store
+    // is deliberately bare: the carrier packet's release fence is what publishes it, and a
+    // release-ordered store would fence before the store rather than after it.
+    __kernel void __amd_rocclr_graphEdgeSignal(__global ulong* dst, ulong value) {
+      *dst = value;
     });
 
 const char* HipExtraSourceCode = BLIT_KERNELS(

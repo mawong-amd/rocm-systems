@@ -2445,6 +2445,28 @@ static inline FillPatternPayload buildTilePattern(const void* pattern, size_t pa
 }
 
 // ================================================================================================
+bool KernelBlitManager::GetGraphEdgeSignalInfo(GraphEdgeSignalInfo* info) const {
+  amd::Kernel* kernel = kernels_[GraphEdgeSignal];
+  if (kernel == nullptr) {
+    return false;
+  }
+  const auto* dev_kernel = kernel->getDeviceKernel(dev());
+  if (dev_kernel == nullptr) {
+    return false;
+  }
+  info->code_handle = dev_kernel->KernelCodeHandle();
+  info->group_seg = dev_kernel->WorkgroupGroupSegmentByteSize();
+  info->private_seg = dev_kernel->WorkitemPrivateSegmentByteSize();
+  info->kernarg_size = dev_kernel->KernargSegmentByteSize();
+  info->kernarg_align = dev_kernel->KernargSegmentAlignment();
+  // The signature is the authority on argument placement: a hidden-argument prologue of a
+  // different shape would silently move them.
+  info->off_dst = static_cast<uint32_t>(kernel->signature().at(0).offset_);
+  info->off_value = static_cast<uint32_t>(kernel->signature().at(1).offset_);
+  return (info->code_handle != 0);
+}
+
+// ================================================================================================
 bool KernelBlitManager::fillBuffer1D(device::Memory& memory, const void* pattern,
                                      size_t patternSize, const amd::Coord3D& surface,
                                      const amd::Coord3D& origin, const amd::Coord3D& size,

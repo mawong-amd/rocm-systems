@@ -303,6 +303,7 @@ class KernelBlitManager : public DmaBlitManager {
     StreamOpsIncrement,
     StreamOpsDecrement,
     BlitCopyBufferBatch,
+    GraphEdgeSignal,
     BlitLinearTotal,
     FillImage = BlitLinearTotal,
     BlitCopyImage,
@@ -547,6 +548,20 @@ class KernelBlitManager : public DmaBlitManager {
   virtual bool initHeap(device::Memory* heap_to_initialize, device::Memory* initial_blocks,
                         uint heap_size, uint number_of_initial_blocks) const;
 
+  //! Everything needed to hand-build a graphEdgeSignal dispatch packet.
+  struct GraphEdgeSignalInfo {
+    uint64_t code_handle;
+    uint32_t group_seg;
+    uint32_t private_seg;
+    uint32_t kernarg_size;
+    uint32_t kernarg_align;
+    uint32_t off_dst;
+    uint32_t off_value;
+  };
+  //! False when the carrier kernel is absent, so the caller keeps a stock topology rather
+  //! than emitting a packet with a null code handle.
+  bool GetGraphEdgeSignalInfo(GraphEdgeSignalInfo* info) const;
+
  private:
   static constexpr size_t MaxXferBuffers = 2;
   static constexpr uint TransferSplitSize = 1;
@@ -653,6 +668,7 @@ static const char* BlitName[KernelBlitManager::BlitTotal] = {
     "__amd_rocclr_initHeap",           "__amd_rocclr_batchMemOp",
     "__amd_rocclr_streamOpsIncrement", "__amd_rocclr_streamOpsDecrement",
     "__amd_rocclr_copyBufferBatch",
+    "__amd_rocclr_graphEdgeSignal",
     "__amd_rocclr_fillImage",          "__amd_rocclr_copyImage",
     "__amd_rocclr_copyImage1DA",       "__amd_rocclr_copyImageToBuffer",
     "__amd_rocclr_copyBufferToImage"};

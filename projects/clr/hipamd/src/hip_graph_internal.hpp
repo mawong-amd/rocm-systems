@@ -177,6 +177,18 @@ class GraphKernelArgManager : public amd::ReferenceCountedObject,
   using KernelArgImpl = device::Settings::KernelArgImpl;
 };
 
+//! One launch's HW event signals, the device they belong to, and — for ordering edge mode 3 —
+//! the kernarg block whose image i addresses signal i's value word. The block is part of the
+//! set so that it cannot outlive the signals it names, or be freed through another device.
+struct GraphSignalSet {
+  std::vector<void*> signals;
+  amd::Device* device = nullptr;
+  uint64_t kernarg_base = 0;
+  uint32_t kernarg_stride = 0;
+
+  bool empty() const { return signals.empty(); }
+};
+
 //! Per-GraphExecBase pool of HW event sets.
 class GraphSignalManager : public amd::ReferenceCountedObject {
  public:
@@ -185,20 +197,25 @@ class GraphSignalManager : public amd::ReferenceCountedObject {
 
   //! Pre-create `num_sets` signal sets of `count` signals each at instantiate
   //! time, so launches never pay signal creation on the hot path.
-  bool Prepopulate(amd::Device* device, int count, int num_sets);
+  bool Prepopulate(amd::Device* device, int count, int num_sets, bool edge_kernargs);
 
   //! Acquire a ready signal set for a single launch. Pops from the free pool;
   //! only creates a new set as a fallback if the pool is unexpectedly empty.
-  bool AcquireSet(amd::Device* device, int count, std::vector<void*>& out_set);
+  bool AcquireSet(amd::Device* device, int count, bool edge_kernargs, GraphSignalSet& out_set);
 
   //! Re-arm a used set and return it to the free pool. Called from the launch
   //! completion callback, which guarantees the launch's GPU work has finished.
-  void ReleaseSet(amd::Device* device, std::vector<void*>& set);
+  void ReleaseSet(GraphSignalSet& set);
 
  private:
+  //! Signals plus, when asked for, their kernarg block. Either both are created or neither is,
+  //! so a set never reaches a launch half-built.
+  bool CreateSet(amd::Device* device, int count, bool edge_kernargs, GraphSignalSet& out_set);
+  void DestroySet(GraphSignalSet& set);
+
   std::mutex lock_;
   //! Per-device stack of free signal sets available for reuse.
-  std::unordered_map<amd::Device*, std::vector<std::vector<void*>>> free_sets_;
+  std::unordered_map<amd::Device*, std::vector<GraphSignalSet>> free_sets_;
 };
 
 class GraphNode : public hipGraphNodeDOTAttribute {
@@ -1078,7 +1095,7 @@ class GraphExecBase : public amd::ReferenceCountedObject, public Graph {
     return hipSuccess;
   }
   //! Recycle HW event signals borrowed for a launch. No-op on classic path.
-  virtual void RecycleLaunchSignals(amd::Device* device, std::vector<void*>& signal_set) {}
+  virtual void RecycleLaunchSignals(GraphSignalSet& signal_set) {}
 
  protected:
   uint64_t flags_ = 0;
@@ -1146,9 +1163,9 @@ class GraphExecSegmented : public GraphExecBase {
   // Handle packetBatches_ updates when nodes are enabled/disabled
   hipError_t UpdatePacketBatchesForNodeEnableDisable(hip::GraphNode* node, bool isEnabled) override;
   //! Recycle HW event signals borrowed for a launch back to the signal pool.
-  void RecycleLaunchSignals(amd::Device* device, std::vector<void*>& signal_set) override {
+  void RecycleLaunchSignals(GraphSignalSet& signal_set) override {
     if (signalManager_ != nullptr && !signal_set.empty()) {
-      signalManager_->ReleaseSet(device, signal_set);
+      signalManager_->ReleaseSet(signal_set);
     }
   }
   // Kernel arg manager is for the entire graph.
@@ -1169,7 +1186,7 @@ class GraphExecSegmented : public GraphExecBase {
   amd::Command* EnqueueSegmentedGraph(hip::Stream* launch_stream,
                                       const std::vector<hip::Stream*>& streams,
                                       hipError_t* out_status = nullptr,
-                                      std::vector<void*>* out_signal_set = nullptr);
+                                      GraphSignalSet* out_signal_set = nullptr);
   hipError_t EnqueueSegment(const Segment& segment, hip::Stream* stream,
                             amd::AccumulateCommand* accumulate);
 
@@ -1300,6 +1317,7 @@ class GraphExecSegmented : public GraphExecBase {
     std::vector<int> seg_to_hw_event;
 
     std::vector<amd::Device::HwEventPatch> patch_list;
+    bool has_blit_edges = false;  //!< any kBlitKernargAddr patch present
     std::vector<uint8_t*> barrier_packets;
     std::vector<int> leaf_segment_ids;
 

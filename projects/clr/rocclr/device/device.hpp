@@ -2262,6 +2262,10 @@ class Device : public RuntimeObject {
   struct HwEventPatch {
     static constexpr int kCompletionSignal = -1;
     static constexpr int kExtDispatchDepSignal = -2;
+    //! Patch kernarg_address to this launch's signal-set block. A packet field, not a kernarg
+    //! one: packets are snapshotted into the ring on the caller's thread, while kernarg memory
+    //! is read asynchronously and shared by every launch in flight.
+    static constexpr int kBlitKernargAddr = -3;
 
     uint8_t* packet;      // original dispatchPackets pointer (for UpdateAQLPacket matching)
     uint8_t* flat_packet; // pointer into flatPacketData (patched directly at launch)
@@ -2270,8 +2274,23 @@ class Device : public RuntimeObject {
   };
 
   virtual uint8_t* CreateBarrierPacket() const { return nullptr; }
+
+  //! One-workgroup dispatch packet for the ordering-edge carrier kernel. nullptr means the
+  //! carrier is unavailable and the caller must keep a stock topology, not that it failed.
+  virtual uint8_t* CreateGraphEdgeSignalPacket() const { return nullptr; }
+
+  //! Allocate and fill a kernarg block for one signal set: image i addresses signal i's
+  //! value word.
+  virtual uint64_t CreateGraphEdgeKernargBlock(const std::vector<void*>& signals,
+                                               uint32_t* stride) const { return 0; }
+  virtual void DestroyGraphEdgeKernargBlock(uint64_t base) const {}
+
   virtual void ApplyHwEventPatches(const std::vector<HwEventPatch>& patches,
                                    const std::vector<void*>& hw_events) const {}
+
+  //! Point every ordering-edge carrier packet at this launch's kernarg block.
+  virtual void ApplyGraphEdgeKernargs(const std::vector<HwEventPatch>& patches,
+                                      uint64_t kernarg_base, uint32_t stride) const {}
 
   virtual const bool isFineGrainSupported() const {
     return (info().svmCapabilities_ & CL_DEVICE_SVM_ATOMICS) != 0 ? true : false;

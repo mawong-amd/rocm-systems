@@ -4213,9 +4213,113 @@ uint8_t* Device::CreateBarrierPacket() const {
 }
 
 // ================================================================================================
+// A graph ordering edge carried on a kernel store instead of a CP completion signal
+// (DEBUG_CLR_DEVICE_ORDERING_EDGE=3).
+
+// hsa_amd_signal_value_pointer() rejects a device-resident value word, so the address comes
+// from the handle, which is the amd_signal_t. Loads and plain stores are supported there;
+// read-modify-write is not.
+static inline uint64_t SignalValueWordAddress(void* hw_event) {
+  auto* ps = reinterpret_cast<ProfilingSignal*>(hw_event);
+  auto* signal = reinterpret_cast<amd_signal_t*>(ps->signal_.handle);
+  return reinterpret_cast<uint64_t>(&signal->value);
+}
+
+static bool GraphEdgeSignalGeometry(const Device& device,
+                                    KernelBlitManager::GraphEdgeSignalInfo* info) {
+  const auto* km = dynamic_cast<const KernelBlitManager*>(&device.xferMgr());
+  return (km != nullptr) && km->GetGraphEdgeSignalInfo(info);
+}
+
+uint8_t* Device::CreateGraphEdgeSignalPacket() const {
+  KernelBlitManager::GraphEdgeSignalInfo info = {};
+  if (!GraphEdgeSignalGeometry(*this, &info)) {
+    return nullptr;
+  }
+
+  // The barrier bit is the ordering: it holds the carrier until the producer has retired,
+  // including the producer's own release fence. The carrier's store is bare, so this packet's
+  // release fence is in turn the only thing that publishes the value word; agent scope is
+  // enough for both the consuming command processor and a host reader of that word. The
+  // kernel reads nothing, so acquire is none.
+  const uint16_t header =
+      (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) |
+      (1 << HSA_PACKET_HEADER_BARRIER) |
+      (HSA_FENCE_SCOPE_NONE << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) |
+      (HSA_FENCE_SCOPE_AGENT << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
+
+  static_assert(sizeof(hsa_kernel_dispatch_packet_t) == 64, "AQL packet size must be 64 bytes");
+  auto* raw = new uint8_t[64]();
+  auto* pkt = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(raw);
+  pkt->header = header;
+  pkt->setup = 1;  // 1-D; the unused dimensions must still read as 1
+  pkt->workgroup_size_x = 1;
+  pkt->workgroup_size_y = 1;
+  pkt->workgroup_size_z = 1;
+  pkt->grid_size_x = 1;
+  pkt->grid_size_y = 1;
+  pkt->grid_size_z = 1;
+  pkt->group_segment_size = info.group_seg;
+  pkt->private_segment_size = info.private_seg;
+  pkt->kernel_object = info.code_handle;
+  pkt->kernarg_address = nullptr;  // patched per launch -- see ApplyGraphEdgeKernargs
+  return raw;
+}
+
+uint64_t Device::CreateGraphEdgeKernargBlock(const std::vector<void*>& signals,
+                                             uint32_t* stride) const {
+  KernelBlitManager::GraphEdgeSignalInfo info = {};
+  if (!GraphEdgeSignalGeometry(*this, &info)) {
+    return 0;
+  }
+  const uint32_t step = amd::alignUp(info.kernarg_size, std::max<uint32_t>(info.kernarg_align, 16));
+  const size_t bytes = static_cast<size_t>(step) * signals.size();
+  auto* base = reinterpret_cast<address>(
+      const_cast<Device*>(this)->hostAlloc(bytes, 0, MemorySegment::kKernArg));
+  if (base == nullptr) {
+    return 0;
+  }
+  // Every hidden argument must read as 0; the explicit ones are written over the zero fill.
+  std::memset(base, 0, bytes);
+  for (size_t i = 0; i < signals.size(); ++i) {
+    address img = base + i * step;
+    const uint64_t dst = SignalValueWordAddress(signals[i]);
+    const uint64_t value = 0;  // a barrier-AND dependency is satisfied at value 0
+    std::memcpy(img + info.off_dst, &dst, sizeof(dst));
+    std::memcpy(img + info.off_value, &value, sizeof(value));
+  }
+  *stride = step;
+  return reinterpret_cast<uint64_t>(base);
+}
+
+void Device::DestroyGraphEdgeKernargBlock(uint64_t base) const {
+  const_cast<Device*>(this)->hostFree(reinterpret_cast<void*>(base));
+}
+
+void Device::ApplyGraphEdgeKernargs(const std::vector<HwEventPatch>& patches,
+                                    uint64_t kernarg_base, uint32_t stride) const {
+  for (const auto& patch : patches) {
+    if (patch.dep_slot != HwEventPatch::kBlitKernargAddr) {
+      continue;
+    }
+    uint8_t* raw = patch.flat_packet ? patch.flat_packet : patch.packet;
+    auto* pkt = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(raw);
+    pkt->kernarg_address =
+        reinterpret_cast<void*>(kernarg_base + static_cast<uint64_t>(stride) * patch.hw_event_index);
+  }
+}
+
+// ================================================================================================
 void Device::ApplyHwEventPatches(const std::vector<HwEventPatch>& patches,
                                  const std::vector<void*>& hw_events) const {
   for (const auto& patch : patches) {
+    if (patch.dep_slot == HwEventPatch::kBlitKernargAddr) {
+      // Patched by ApplyGraphEdgeKernargs, and skipping is not cosmetic: dep_slot is
+      // negative, so the dep_signal[] branch below would write before the packet. The
+      // carrier's signal is never reset here either, which is correct -- no command
+      // processor stamps its start_ts/end_ts, so profiling must not read them.
+      continue;
+    }
     auto* ps = reinterpret_cast<ProfilingSignal*>(hw_events[patch.hw_event_index]);
     hsa_signal_t sig = ps->signal_;
 

@@ -220,7 +220,9 @@ release(uint, ROC_EDGE_SIGNAL_POOL_SIZE, 16384,                               \
 release(uint, DEBUG_CLR_DEVICE_ORDERING_EDGE, 1,                              \
         "Cross queue ordering edges: 0 off (host resident value word), "      \
         "1 device resident, segment completion signal on its own barrier, "   \
-        "2 device resident, completion signal on the kernel dispatch")        \
+        "2 device resident, completion signal on the kernel dispatch, "       \
+        "3 device resident, no completion signal, a one workgroup blit "      \
+        "kernel stores the value word instead")                               \
 release(uint, DEBUG_CLR_LIMIT_BLIT_WG, 16,                                    \
         "Limit the number of workgroups in blit operations")                  \
 release(bool, DEBUG_CLR_BLIT_KERNARG_OPT, false,                              \
